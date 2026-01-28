@@ -14,4 +14,7 @@ dependencies = [
     "playwright>=1.57.0",
     "pymupdf>=1.26.7",
     "requests>=2.32.5",
+    "scikit-learn>=1.8.0",
+    "scipy>=1.17.0",
+    "seaborn>=0.13.2",
 ]
