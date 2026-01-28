@@ -9,6 +9,7 @@ dependencies = [
     "curl-cffi>=0.14.0",
     "datasets>=4.5.0",
     "fasttext>=0.9.3",
+    "lingua-language-detector>=2.1.1",
     "nltk>=3.9.2",
     "playwright>=1.57.0",
     "pymupdf>=1.26.7",
