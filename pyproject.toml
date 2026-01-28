@@ -1,0 +1,16 @@
+[project]
+name = "emse-thesis"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "bs4>=0.0.2",
+    "curl-cffi>=0.14.0",
+    "datasets>=4.5.0",
+    "fasttext>=0.9.3",
+    "nltk>=3.9.2",
+    "playwright>=1.57.0",
+    "pymupdf>=1.26.7",
+    "requests>=2.32.5",
+]
