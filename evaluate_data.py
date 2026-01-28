@@ -15,6 +15,7 @@ from lingua import Language, LanguageDetectorBuilder
 # Configuration
 input_texts = 'test_data.jsonl'
 output_file = 'evaluation_results.jsonl'
+word_output_file = 'word_results.jsonl'
 
 # Load models
 # Suppress FastText warnings
@@ -31,6 +32,7 @@ lingua_detector = LanguageDetectorBuilder.from_languages(*lingua_languages).buil
 
 models = {
     'fasttext-lid.176': ('fasttext', fasttext.load_model('models/lid.176.bin')),
+    'fasttext-lid.176compressed': ('fasttext', fasttext.load_model('models/lid.176.ftz')),
     'glotlid': ('fasttext', fasttext.load_model(hf_hub_download(repo_id="cis-lmu/glotlid", filename="model.bin"))),
     'lingua': ('lingua', lingua_detector)
 }
@@ -117,3 +119,38 @@ with open(output_file, 'w', encoding='utf-8') as f:
 
 print(f"Processed {len(samples)} samples with {len(models)} models ({len(results)} total results)")
 print(f"Results saved to {output_file}")
+
+unique_words = set()
+for sample in samples:
+    text = sample['text']
+    clean_text = text.replace('\n', ' ')
+    words = clean_text.split()
+    words = [(word, sample['lang']) for word in words]
+    unique_words.update(words)
+
+word_results = []
+
+for word, lang in unique_words:
+    for model_name, (model_type, model) in models.items():
+        detected_lang, confidence = detect_language(word, model_type, model)
+
+        # Handle cases where lingua returns None
+        if detected_lang is None:
+            detected_lang = 'unknown'
+
+        result = {
+            'word': word,
+            'model': model_name,
+            'true_lang': lang,
+            'detected_lang': detected_lang,
+            'confidence': float(confidence)
+        }
+        word_results.append(result)
+
+# Write word results to output file
+with open(word_output_file, 'w', encoding='utf-8') as f:
+    for result in word_results:
+        f.write(json.dumps(result, ensure_ascii=False) + '\n')
+
+print(f"Processed {len(unique_words)} unique words with {len(models)} models ({len(word_results)} total results)")
+print(f"Results saved to {word_output_file}")
