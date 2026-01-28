@@ -3,12 +3,14 @@
 #     "fasttext",
 #     "numpy<2",
 #     "huggingface_hub",
+#     "lingua-language-detector",
 # ]
 # ///
 
 import fasttext
 import json
 from huggingface_hub import hf_hub_download
+from lingua import Language, LanguageDetectorBuilder
 
 # Configuration
 input_texts = 'test_data.jsonl'
@@ -18,9 +20,19 @@ output_file = 'evaluation_results.jsonl'
 # Suppress FastText warnings
 fasttext.FastText.eprint = lambda x: None
 
+# Initialize lingua detector with test data languages
+lingua_languages = [
+    Language.ENGLISH, Language.FRENCH, Language.SPANISH, Language.ITALIAN,
+    Language.GERMAN, Language.PORTUGUESE, Language.RUSSIAN, Language.TURKISH,
+    Language.INDONESIAN, Language.UKRAINIAN, Language.VIETNAMESE, Language.DUTCH,
+    Language.POLISH, Language.ROMANIAN
+]
+lingua_detector = LanguageDetectorBuilder.from_languages(*lingua_languages).build()
+
 models = {
-    'fasttext-lid.176': fasttext.load_model('models/lid.176.bin'),
-    'glotlid': fasttext.load_model(hf_hub_download(repo_id="cis-lmu/glotlid", filename="model.bin"))
+    'fasttext-lid.176': ('fasttext', fasttext.load_model('models/lid.176.bin')),
+    'glotlid': ('fasttext', fasttext.load_model(hf_hub_download(repo_id="cis-lmu/glotlid", filename="model.bin"))),
+    'lingua': ('lingua', lingua_detector)
 }
 
 # Mapping from ISO 639-3 to ISO 639-1 for common languages
@@ -31,28 +43,42 @@ ISO_639_3_TO_1 = {
     'zho': 'zh', 'kor': 'ko', 'ara': 'ar', 'hin': 'hi', 'swe': 'sv',
 }
 
-def detect_language(text, model):
-    # FastText assumes input is a single line.
-    # Newlines can cause it to crash or behave unexpectedly.
+def detect_language(text, model_type, model):
+    # Models assume input is a single line
     clean_text = text.replace('\n', ' ')
+    if model_type == 'fasttext':
 
-    # .predict returns a tuple: (labels, probabilities)
-    # k=1 means return only the top 1 result
-    prediction = model.predict(clean_text, k=1)
+        # .predict returns a tuple: (labels, probabilities)
+        # k=1 means return only the top 1 result
+        prediction = model.predict(clean_text, k=1)
 
-    # Extract the label and probability
-    label = prediction[0][0]
-    confidence = prediction[1][0]
+        # Extract the label and probability
+        label = prediction[0][0]
+        confidence = prediction[1][0]
 
-    # FastText labels look like "__label__en".
-    # We strip the "__label__" prefix to get just the code (e.g., "en")
-    lang_code = label.replace("__label__", "")
+        # FastText labels look like "__label__en".
+        # We strip the "__label__" prefix to get just the code (e.g., "en")
+        lang_code = label.replace("__label__", "")
 
-    # Normalize GlotLID format (e.g., "eng_Latn" -> "en")
-    # GlotLID uses ISO 639-3 codes with script notation
-    if '_' in lang_code:
-        iso_639_3 = lang_code.split('_')[0]  # Extract ISO 639-3 code
-        lang_code = ISO_639_3_TO_1.get(iso_639_3, iso_639_3)  # Map to ISO 639-1, fallback to 639-3
+        # Normalize GlotLID format (e.g., "eng_Latn" -> "en")
+        # GlotLID uses ISO 639-3 codes with script notation
+        if '_' in lang_code:
+            iso_639_3 = lang_code.split('_')[0]  # Extract ISO 639-3 code
+            lang_code = ISO_639_3_TO_1.get(iso_639_3, iso_639_3)  # Map to ISO 639-1, fallback to 639-3
+
+    elif model_type == 'lingua':
+
+        # Get all confidence values
+        confidence_values = model.compute_language_confidence_values(clean_text)
+
+        if not confidence_values:
+            # No detection possible - return None
+            return None, 0.0
+
+        # Get top prediction
+        top_prediction = confidence_values[0]
+        lang_code = top_prediction.language.iso_code_639_1.name.lower()
+        confidence = top_prediction.value
 
     return lang_code, confidence
 
@@ -64,8 +90,12 @@ for sample in samples:
     text = sample['text']
 
     # Evaluate with each model
-    for model_name, model in models.items():
-        detected_lang, confidence = detect_language(text, model)
+    for model_name, (model_type, model) in models.items():
+        detected_lang, confidence = detect_language(text, model_type, model)
+
+        # Handle cases where lingua returns None
+        if detected_lang is None:
+            detected_lang = 'unknown'
 
         result = {
             'correct': sample['lang'] == detected_lang,
