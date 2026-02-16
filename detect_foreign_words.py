@@ -44,6 +44,16 @@ ISO_639_3_TO_1 = {
     "swe": "sv",
 }
 
+# Language code to human-readable name mapping
+LANG_NAMES = {
+    "en": "English", "fr": "French", "es": "Spanish", "de": "German",
+    "it": "Italian", "pt": "Portuguese", "ru": "Russian", "tr": "Turkish",
+    "id": "Indonesian", "uk": "Ukrainian", "vi": "Vietnamese",
+    "nl": "Dutch", "pl": "Polish", "ro": "Romanian",
+    "ja": "Japanese", "zh": "Chinese", "ko": "Korean",
+    "ar": "Arabic", "hi": "Hindi", "sv": "Swedish",
+}
+
 SUPPORTED_MODELS = [
     "fasttext-lid.176",
     "fasttext-lid.176compressed",

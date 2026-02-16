@@ -1,14 +1,77 @@
 # EMSE-Thesis
 
-## Foreign word detection CLI
+Evaluate language detection models for identifying foreign words in documents. Compares four language detection models (FastText lid.176, FastText Compressed, GlotLID, and Lingua) at both document-level and word-level detection. Includes a GUI and CLI for interactive foreign word detection.
 
-Detect a document’s main language, then identify words whose detected language differs from the document language.
+## Prerequisites
 
-### Usage
+- Python 3.12+
+- [`uv`](https://docs.astral.sh/uv/) package manager
 
-Run the script with a text file or PDF input and an output JSONL path.
+## Installation
 
+```bash
+uv sync
 ```
+
+## Model Setup
+
+Four language detection models are supported. Some require manual download.
+
+| Model | Flag value | Setup |
+|---|---|---|
+| FastText (full) | `fasttext-lid.176` | Download `lid.176.bin` from [fasttext.cc](https://fasttext.cc/docs/en/language-identification.html) and place in `models/` |
+| FastText (compressed) | `fasttext-lid.176compressed` | Download `lid.176.ftz` from [fasttext.cc](https://fasttext.cc/docs/en/language-identification.html) and place in `models/` |
+| GlotLID | `glotlid` | Downloaded automatically from Hugging Face on first run |
+| Lingua | `lingua` | Built-in, no download needed |
+
+Create the `models/` directory if it doesn't exist:
+
+```bash
+mkdir -p models
+```
+
+## Hugging Face Setup
+
+A Hugging Face account is needed for some features:
+
+- **GlotLID auto-download**: The model repo is public, so a token is optional but recommended to avoid rate limits.
+- **Data pipeline** (`fetch_data.py`): A token is **required** to download datasets.
+
+To set up:
+
+1. Create a free account at [huggingface.co](https://huggingface.co)
+2. Generate an access token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
+3. Either set `HUGGING_FACE_TOKEN` in a `.env` file, or run `huggingface-cli login` to authenticate globally
+
+## GUI Usage
+
+Launch the web-based GUI:
+
+```bash
+python gui.py
+```
+
+This opens a Gradio app in your browser with the following workflow:
+
+1. **Select models** from the Document Model and Word Model dropdowns
+2. **Upload** a `.txt` or `.pdf` file
+3. **Adjust the confidence threshold** slider (0 = no filtering)
+4. Click **Run Detection**
+
+The results are shown in two tabs:
+
+- **Table View** — browse detected words in a table; select a row to load it into the correction panel
+- **Document View** — see the full document with foreign words highlighted by language; filter which languages are highlighted using the checkboxes
+
+Both tabs include a **Correction Panel**: select a word, pick the correct language from the dropdown, and click "Apply Correction". This corrects all occurrences of that word.
+
+Click **Save Results** to write the (corrected) results as JSONL to the output path.
+
+## CLI Usage
+
+Detect a document's main language, then identify words whose detected language differs from the document language.
+
+```bash
 python detect_foreign_words.py --input path/to/document.txt --output foreign_words.jsonl
 python detect_foreign_words.py --input path/to/document.pdf --output foreign_words.jsonl
 ```
@@ -22,11 +85,12 @@ Optional arguments:
 --input-format {auto,txt,pdf}
 ```
 
-### Output format
+## Output Format
 
 The output is JSON Lines (one JSON object per foreign word) with these fields:
 
 - `word`: the word token (whitespace split)
+- `normalized_word`: the word with punctuation stripped
 - `index`: zero-based index of the word in the document
 - `detected_lang`: detected language of the word
 - `confidence`: model confidence for the word detection

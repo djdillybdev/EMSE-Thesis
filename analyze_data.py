@@ -17,18 +17,12 @@ from scipy.stats import chi2
 from itertools import combinations
 import numpy as np
 
+from detect_foreign_words import LANG_NAMES
+
 # Configuration
 TEXT_RESULTS_FILE = 'evaluation_results.jsonl'
 WORD_RESULTS_FILE = 'word_results.jsonl'
 PLOTS_DIR = 'plots'
-
-# Language code to name mapping for better readability
-LANG_NAMES = {
-    'en': 'English', 'fr': 'French', 'es': 'Spanish', 'it': 'Italian',
-    'de': 'German', 'pt': 'Portuguese', 'ru': 'Russian', 'tr': 'Turkish',
-    'id': 'Indonesian', 'uk': 'Ukrainian', 'vi': 'Vietnamese',
-    'nl': 'Dutch', 'pl': 'Polish', 'ro': 'Romanian'
-}
 
 # Model display names
 MODEL_NAMES = {
