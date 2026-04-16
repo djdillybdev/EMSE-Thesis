@@ -12,6 +12,7 @@ dependencies = [
     "gradio>=6.5.1",
     "lingua-language-detector>=2.1.1",
     "nltk>=3.9.2",
+    "numpy<2",
     "playwright>=1.57.0",
     "pymupdf>=1.26.7",
     "requests>=2.32.5",

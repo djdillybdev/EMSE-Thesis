@@ -30,12 +30,50 @@ Create the `models/` directory if it doesn't exist:
 mkdir -p models
 ```
 
+## Train Binary Spanish Classifier
+
+Train a local fastText classifier that predicts whether short text is Spanish or not Spanish:
+
+```bash
+uv run python src/train_binary_model.py \
+  --output-model models/spanish_binary.bin \
+  --output-dir models/spanish_binary_training \
+  --positive-samples 5000 \
+  --negative-samples 5000 \
+  --epoch 25 \
+  --word-ngrams 2 \
+  --quantize
+```
+
+The training script uses Hugging Face datasets for data loading only. It trains from `wikimedia/wikipedia` and `Helsinki-NLP/europarl`, then evaluates separately on FLORES+ as held-out benchmark data. FLORES+ is not used for training. FLORES+ is gated on Hugging Face, so set `HUGGING_FACE_TOKEN` in `.env`, authenticate globally, or pass `--skip-flores-eval` while testing the training path.
+
+Outputs are written locally:
+
+- `models/spanish_binary.bin`: fastText model
+- `models/spanish_binary.ftz`: quantized model when `--quantize` is passed
+- `models/spanish_binary_training/validation_metrics.json`: validation metrics from training-source data
+- `models/spanish_binary_training/flores_metrics.json`: held-out FLORES+ metrics
+
+By default, `src/train_binary_model.py` loads `.env` before reading `HUGGING_FACE_TOKEN`. Use `--env-file path/to/.env` for a different file, or `--hf-token-env HF_TOKEN` if your token is stored under another variable name.
+
+Run a quick prediction:
+
+```bash
+python - <<'PY'
+import fasttext
+
+model = fasttext.load_model("models/spanish_binary.bin")
+labels, scores = model.predict("Este es un texto de ejemplo.", k=1)
+print(labels[0].replace("__label__", ""), float(scores[0]))
+PY
+```
+
 ## Hugging Face Setup
 
 A Hugging Face account is needed for some features:
 
 - **GlotLID auto-download**: The model repo is public, so a token is optional but recommended to avoid rate limits.
-- **Data pipeline** (`fetch_data.py`): A token is **required** to download datasets.
+- **Data pipeline** (`fetch_data.py` and `src/train_binary_model.py`): A token may be required to download gated datasets or avoid rate limits.
 
 To set up:
 
