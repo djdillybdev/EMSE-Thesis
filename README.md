@@ -68,6 +68,24 @@ print(labels[0].replace("__label__", ""), float(scores[0]))
 PY
 ```
 
+Train a word-level model for detecting whether individual words are Spanish:
+
+```bash
+uv run python src/train_binary_model.py \
+  --training-unit word \
+  --output-model models/spanish_binary_words.bin \
+  --output-dir models/spanish_binary_words_training \
+  --positive-samples 20000 \
+  --negative-samples 20000 \
+  --min-word-chars 3 \
+  --word-ngrams 1 \
+  --dim 50 \
+  --epoch 20 \
+  --lr 0.3
+```
+
+Word-level mode preserves Unicode alphabetic Spanish words with accents and tildes, such as `acción`, `niño`, `vergüenza`, `está`, and `rápido`. It drops noisy tokens with digits, URLs, emails, underscores, or internal punctuation. Single-word language detection is ambiguous, so evaluate this model manually on Spanish documents with embedded foreign words before using it as the only signal.
+
 ## Hugging Face Setup
 
 A Hugging Face account is needed for some features:

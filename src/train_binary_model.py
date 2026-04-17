@@ -25,6 +25,8 @@ DEFAULT_FLORES_NEGATIVE_CONFIGS = (
 WHITESPACE_RE = re.compile(r"\s+")
 FASTTEXT_LABEL_RE = re.compile(r"__label__\S+")
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+URL_RE = re.compile(r"^(https?://|www\.)", flags=re.IGNORECASE)
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 @dataclass(frozen=True)
@@ -93,6 +95,24 @@ def parse_args():
         type=int,
         default=3,
         help="Maximum snippets to take from one source record.",
+    )
+    parser.add_argument(
+        "--training-unit",
+        choices=["sentence", "word"],
+        default="sentence",
+        help="Train on short text snippets or individual word tokens.",
+    )
+    parser.add_argument(
+        "--min-word-chars",
+        type=int,
+        default=3,
+        help="Minimum Unicode alphabetic token length for --training-unit word.",
+    )
+    parser.add_argument(
+        "--max-tokens-per-record",
+        type=int,
+        default=50,
+        help="Maximum word tokens to take from one source record in word mode.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -261,6 +281,66 @@ def split_short_texts(text, min_chars, max_chars, max_chunks):
     return normalized
 
 
+def strip_surrounding_punctuation(token):
+    start = 0
+    end = len(token)
+
+    while start < end and not token[start].isalpha():
+        start += 1
+    while end > start and not token[end - 1].isalpha():
+        end -= 1
+
+    return token[start:end]
+
+
+def extract_word_tokens(text, min_word_chars, max_tokens):
+    tokens = []
+    seen = set()
+
+    for raw_token in WHITESPACE_RE.split(text or ""):
+        if not raw_token:
+            continue
+        if FASTTEXT_LABEL_RE.search(raw_token):
+            continue
+        if URL_RE.match(raw_token) or EMAIL_RE.match(raw_token):
+            continue
+        if any(char.isdigit() for char in raw_token):
+            continue
+
+        token = strip_surrounding_punctuation(raw_token).casefold()
+        if len(token) < min_word_chars:
+            continue
+        if "_" in token:
+            continue
+        if not token.isalpha():
+            continue
+        if token in seen:
+            continue
+
+        tokens.append(token)
+        seen.add(token)
+        if len(tokens) >= max_tokens:
+            break
+
+    return tokens
+
+
+def extract_training_units(
+    text,
+    training_unit,
+    min_chars,
+    max_chars,
+    max_chunks_per_record,
+    min_word_chars,
+    max_tokens_per_record,
+):
+    if training_unit == "sentence":
+        return split_short_texts(text, min_chars, max_chars, max_chunks_per_record)
+    if training_unit == "word":
+        return extract_word_tokens(text, min_word_chars, max_tokens_per_record)
+    raise ValueError(f"Unsupported training unit '{training_unit}'.")
+
+
 def dataset_kwargs(token):
     return {"token": token} if token else {}
 
@@ -281,16 +361,22 @@ def collect_wikipedia_examples(
     lang,
     label,
     limit,
+    training_unit,
     min_chars,
     max_chars,
     max_chunks_per_record,
+    min_word_chars,
+    max_tokens_per_record,
     token,
 ):
     if limit <= 0:
         return []
 
     config = f"{snapshot}.{lang}"
-    log(f"Loading Wikipedia {config} for {label} examples; target={limit}")
+    log(
+        f"Loading Wikipedia {config} for {label} {training_unit} examples; "
+        f"target={limit}"
+    )
     dataset = load_streaming_dataset(dataset_name, config, "train", token)
     examples = []
     seen = set()
@@ -298,8 +384,14 @@ def collect_wikipedia_examples(
     next_report = max(1, min(100, limit // 10 or 1))
 
     for row in dataset:
-        for text in split_short_texts(
-            row.get("text", ""), min_chars, max_chars, max_chunks_per_record
+        for text in extract_training_units(
+            row.get("text", ""),
+            training_unit,
+            min_chars,
+            max_chars,
+            max_chunks_per_record,
+            min_word_chars,
+            max_tokens_per_record,
         ):
             key = text.casefold()
             if key in seen:
@@ -325,8 +417,11 @@ def collect_europarl_examples(
     label,
     target_languages,
     limit,
+    training_unit,
     min_chars,
     max_chars,
+    min_word_chars,
+    max_tokens_per_record,
     token,
 ):
     if limit <= 0:
@@ -342,7 +437,7 @@ def collect_europarl_examples(
 
     for pair in pairs:
         log(
-            f"Loading Europarl {pair} for {label} examples "
+            f"Loading Europarl {pair} for {label} {training_unit} examples "
             f"from {', '.join(sorted(target_languages))}; "
             f"current={len(examples)}/{limit}"
         )
@@ -352,25 +447,36 @@ def collect_europarl_examples(
             for lang, value in translation.items():
                 if lang not in target_languages:
                     continue
-                text = normalize_text(value, min_chars, max_chars)
-                if not text:
-                    continue
-                key = text.casefold()
-                if key in seen:
-                    continue
-                seen.add(key)
-                examples.append(
-                    Example(text=text, label=label, source="europarl", language=lang)
-                )
-                next_report = log_progress(
-                    progress_prefix, len(examples), limit, next_report
-                )
-                if len(examples) >= limit:
-                    log(
-                        "Finished Europarl collection: "
-                        f"collected {len(examples)}/{limit}"
+                for text in extract_training_units(
+                    value,
+                    training_unit,
+                    min_chars,
+                    max_chars,
+                    1,
+                    min_word_chars,
+                    max_tokens_per_record,
+                ):
+                    key = text.casefold()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    examples.append(
+                        Example(
+                            text=text,
+                            label=label,
+                            source="europarl",
+                            language=lang,
+                        )
                     )
-                    return examples
+                    next_report = log_progress(
+                        progress_prefix, len(examples), limit, next_report
+                    )
+                    if len(examples) >= limit:
+                        log(
+                            "Finished Europarl collection: "
+                            f"collected {len(examples)}/{limit}"
+                        )
+                        return examples
 
     log(f"Finished Europarl collection: collected {len(examples)}/{limit}")
     return examples
@@ -389,9 +495,12 @@ def collect_balanced_wikipedia_negatives(args, token, total):
                 lang,
                 LABEL_NOT_ES,
                 limit,
+                args.training_unit,
                 args.min_chars,
                 args.max_chars,
                 args.max_chunks_per_record,
+                args.min_word_chars,
+                args.max_tokens_per_record,
                 token,
             )
         )
@@ -414,14 +523,22 @@ def collect_balanced_flores_examples(args, token, total, label, configs):
         progress_prefix = f"FLORES+ {config}"
         next_report = max(1, min(100, limit // 10 or 1))
         for row in dataset:
-            text = normalize_text(row.get("text", ""), args.min_chars, args.max_chars)
-            if not text:
-                continue
-            examples.append(
-                Example(text=text, label=label, source="flores", language=lang)
-            )
-            count += 1
-            next_report = log_progress(progress_prefix, count, limit, next_report)
+            for text in extract_training_units(
+                row.get("text", ""),
+                args.training_unit,
+                args.min_chars,
+                args.max_chars,
+                args.max_chunks_per_record,
+                args.min_word_chars,
+                args.max_tokens_per_record,
+            ):
+                examples.append(
+                    Example(text=text, label=label, source="flores", language=lang)
+                )
+                count += 1
+                next_report = log_progress(progress_prefix, count, limit, next_report)
+                if count >= limit:
+                    break
             if count >= limit:
                 break
         log(f"Finished FLORES+ {config}: collected {count}/{limit}")
@@ -460,6 +577,7 @@ def collect_training_examples(args, token):
 
     log(
         "Training-source targets: "
+        f"unit={args.training_unit}, "
         f"Spanish={args.positive_samples} "
         f"(Wikipedia={positive_wiki_target}, Europarl={positive_euro_target}), "
         f"not-Spanish={args.negative_samples} "
@@ -475,9 +593,12 @@ def collect_training_examples(args, token):
             args.wikipedia_positive_lang,
             LABEL_ES,
             positive_wiki_target,
+            args.training_unit,
             args.min_chars,
             args.max_chars,
             args.max_chunks_per_record,
+            args.min_word_chars,
+            args.max_tokens_per_record,
             token,
         )
     )
@@ -489,8 +610,11 @@ def collect_training_examples(args, token):
             LABEL_ES,
             [args.wikipedia_positive_lang],
             positive_euro_target,
+            args.training_unit,
             args.min_chars,
             args.max_chars,
+            args.min_word_chars,
+            args.max_tokens_per_record,
             token,
         )
     )
@@ -508,8 +632,11 @@ def collect_training_examples(args, token):
             LABEL_NOT_ES,
             negative_languages,
             negative_euro_target,
+            args.training_unit,
             args.min_chars,
             args.max_chars,
+            args.min_word_chars,
+            args.max_tokens_per_record,
             token,
         )
     )
@@ -608,7 +735,7 @@ def predict_label(model, text):
     return labels[0].replace(FASTTEXT_LABEL_PREFIX, "")
 
 
-def evaluate_model(model, examples):
+def evaluate_model(model, examples, training_unit):
     labels = [LABEL_ES, LABEL_NOT_ES]
     confusion = {true: {pred: 0 for pred in labels} for true in labels}
 
@@ -621,6 +748,7 @@ def evaluate_model(model, examples):
     total = sum(sum(row.values()) for row in confusion.values())
     correct = sum(confusion[label][label] for label in labels)
     metrics = {
+        "training_unit": training_unit,
         "total": total,
         "accuracy": correct / total if total else 0.0,
         "confusion_matrix": confusion,
@@ -681,6 +809,16 @@ def main():
     args = parse_args()
     if not 0.0 < args.train_ratio < 1.0:
         raise ValueError("--train-ratio must be between 0 and 1.")
+    if args.min_word_chars < 1:
+        raise ValueError("--min-word-chars must be at least 1.")
+    if args.max_tokens_per_record < 1:
+        raise ValueError("--max-tokens-per-record must be at least 1.")
+
+    if args.training_unit == "word":
+        log(
+            "Word-level mode enabled. Accented Unicode alphabetic words are preserved; "
+            "for this mode, consider --word-ngrams 1 --dim 50 --epoch 20 --lr 0.3."
+        )
 
     loaded_env_keys = load_env_file(args.env_file)
     token = os.getenv(args.dataset_token_env)
@@ -726,6 +864,7 @@ def main():
     write_jsonl(output_dir / "validation_examples.jsonl", validation_examples)
 
     data_summary = {
+        "training_unit": args.training_unit,
         "train": {
             "total": len(train_examples),
             "labels": dict(Counter(example.label for example in train_examples)),
@@ -761,7 +900,7 @@ def main():
     log(f"Saved model to {output_model}")
 
     log("Evaluating validation split...")
-    validation_metrics = evaluate_model(model, validation_examples)
+    validation_metrics = evaluate_model(model, validation_examples, args.training_unit)
     write_json(output_dir / "validation_metrics.json", validation_metrics)
     print_metrics("Validation", validation_metrics)
 
@@ -784,7 +923,7 @@ def main():
 
     write_jsonl(output_dir / "flores_eval_examples.jsonl", flores_examples)
     log("Evaluating FLORES+ held-out split...")
-    flores_metrics = evaluate_model(model, flores_examples)
+    flores_metrics = evaluate_model(model, flores_examples, args.training_unit)
     write_json(output_dir / "flores_metrics.json", flores_metrics)
     print_metrics("FLORES+", flores_metrics)
 
