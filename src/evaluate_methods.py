@@ -389,7 +389,11 @@ class LinguaAdapter(ModelAdapter):
             return build_window_score(self, main_lang, [])
         confidence_values = self.model.compute_language_confidence_values(clean_text)
         label_scores = [
-            (get_lingua_code(value.language), get_lingua_code(value.language), float(value.value))
+            (
+                get_lingua_code(value.language),
+                get_lingua_code(value.language),
+                float(value.value),
+            )
             for value in confidence_values
         ]
         return build_window_score(self, main_lang, label_scores[:top_k])
@@ -549,7 +553,9 @@ def load_models(args):
         loaded = {model.name for model in models}
         missing = selected - loaded
         if missing:
-            raise ValueError(f"Requested model(s) not loaded: {', '.join(sorted(missing))}")
+            raise ValueError(
+                f"Requested model(s) not loaded: {', '.join(sorted(missing))}"
+            )
 
     if not models:
         raise RuntimeError("No models were loaded.")
@@ -558,9 +564,7 @@ def load_models(args):
 
 def load_flores_samples(dataset_name, config, split, token, limit=None):
     log(f"Loading FLORES {config}/{split}")
-    dataset = load_dataset(
-        dataset_name, config, split=split, **dataset_kwargs(token)
-    )
+    dataset = load_dataset(dataset_name, config, split=split, **dataset_kwargs(token))
     lang = config_to_lang(config)
     samples = []
     for index, row in enumerate(dataset):
@@ -655,6 +659,19 @@ def parse_int_csv(value):
     return [int(item) for item in parse_csv(value)]
 
 
+def parse_float_csv(value):
+    return [float(item) for item in parse_csv(str(value))]
+
+
+def parse_window_foreign_thresholds(value):
+    thresholds = parse_float_csv(value)
+    if not thresholds:
+        raise ValueError("--window-foreign-threshold must include at least one float.")
+    if any(threshold < 0.0 or threshold > 1.0 for threshold in thresholds):
+        raise ValueError("--window-foreign-threshold must be in the range [0, 1].")
+    return thresholds
+
+
 def window_score_record(score, extra):
     row = {
         "model": score.model,
@@ -680,7 +697,7 @@ def build_window_rows_and_token_scores(
     model,
     main_lang,
     window_sizes,
-    threshold,
+    thresholds,
     top_k,
     base_extra,
     token_truth,
@@ -730,37 +747,38 @@ def build_window_rows_and_token_scores(
     for (window_size, token_index), scores in sorted(token_score_inputs.items()):
         token_item = tokens_by_raw_index[token_index]
         foreign_probability = sum(score.foreign_score for score in scores) / len(scores)
-        main_lang_probability = (
-            sum(score.main_lang_score for score in scores) / len(scores)
+        main_lang_probability = sum(score.main_lang_score for score in scores) / len(
+            scores
         )
-        predicted = foreign_probability >= threshold
         injection = token_injections.get(token_index, {})
         truth = token_truth(token_index)
-        token_rows.append(
-            {
-                **base_extra,
-                "model": model.name,
-                "model_family": model.family,
-                "detection_method": "window",
-                "window_size": window_size,
-                "token_index": token_item.raw_index,
-                "token": token_item.raw,
-                "normalized_token": token_item.normalized,
-                "main_lang": main_lang,
-                "main_lang_probability": main_lang_probability,
-                "foreign_probability": foreign_probability,
-                "window_count": len(scores),
-                "window_foreign_threshold": threshold,
-                "is_foreign_ground_truth": truth,
-                "is_foreign_predicted": predicted,
-                "correct": truth == predicted,
-                "original_normalized": injection.get("original_normalized"),
-                "replacement_normalized": injection.get("replacement_normalized"),
-                "span_id": injection.get("span_id"),
-                "span_offset": injection.get("span_offset"),
-                "span_length": injection.get("span_length"),
-            }
-        )
+        for threshold in thresholds:
+            predicted = foreign_probability >= threshold
+            token_rows.append(
+                {
+                    **base_extra,
+                    "model": model.name,
+                    "model_family": model.family,
+                    "detection_method": "window",
+                    "window_size": window_size,
+                    "token_index": token_item.raw_index,
+                    "token": token_item.raw,
+                    "normalized_token": token_item.normalized,
+                    "main_lang": main_lang,
+                    "main_lang_probability": main_lang_probability,
+                    "foreign_probability": foreign_probability,
+                    "window_count": len(scores),
+                    "window_foreign_threshold": threshold,
+                    "is_foreign_ground_truth": truth,
+                    "is_foreign_predicted": predicted,
+                    "correct": truth == predicted,
+                    "original_normalized": injection.get("original_normalized"),
+                    "replacement_normalized": injection.get("replacement_normalized"),
+                    "span_id": injection.get("span_id"),
+                    "span_offset": injection.get("span_offset"),
+                    "span_length": injection.get("span_length"),
+                }
+            )
 
     return window_rows, token_rows
 
@@ -781,6 +799,7 @@ def run_pure_evaluation(args, models, token, supported_langs):
     window_rows = []
     window_token_rows = []
     window_sizes = parse_int_csv(args.window_sizes)
+    window_thresholds = parse_window_foreign_thresholds(args.window_foreign_threshold)
 
     for config in configs:
         samples = load_flores_samples(
@@ -827,7 +846,7 @@ def run_pure_evaluation(args, models, token, supported_langs):
                             model=model,
                             main_lang=text_prediction.predicted_lang,
                             window_sizes=window_sizes,
-                            threshold=args.window_foreign_threshold,
+                            thresholds=window_thresholds,
                             top_k=args.window_top_k,
                             base_extra={
                                 **base_extra,
@@ -1023,7 +1042,9 @@ def build_phrase_sample(spanish_sample, foreign_sample, injection_lang, args, rn
     if not spanish_tokens or not foreign_tokens or not raw_parts:
         return None
 
-    target_replacements = max(1, round(len(spanish_tokens) * args.phrase_replacement_ratio))
+    target_replacements = max(
+        1, round(len(spanish_tokens) * args.phrase_replacement_ratio)
+    )
     candidate_starts = list(range(len(spanish_tokens)))
     rng.shuffle(candidate_starts)
 
@@ -1167,6 +1188,7 @@ def run_mixed_evaluation(args, models, sample_filename, output_prefix):
     window_rows = []
     window_token_rows = []
     window_sizes = parse_int_csv(args.window_sizes)
+    window_thresholds = parse_window_foreign_thresholds(args.window_foreign_threshold)
     for sample in mixed_samples:
         injected_indexes = {
             injection["token_index"]: injection for injection in sample["injections"]
@@ -1193,7 +1215,7 @@ def run_mixed_evaluation(args, models, sample_filename, output_prefix):
                         model=model,
                         main_lang=SPANISH,
                         window_sizes=window_sizes,
-                        threshold=args.window_foreign_threshold,
+                        thresholds=window_thresholds,
                         top_k=args.window_top_k,
                         base_extra={
                             **base_extra,
@@ -1238,7 +1260,9 @@ def run_mixed_evaluation(args, models, sample_filename, output_prefix):
 
     write_jsonl(output_dir / f"{output_prefix}_word_predictions.jsonl", rows)
     if not args.skip_window:
-        write_jsonl(output_dir / f"{output_prefix}_window_predictions.jsonl", window_rows)
+        write_jsonl(
+            output_dir / f"{output_prefix}_window_predictions.jsonl", window_rows
+        )
         write_jsonl(
             output_dir / f"{output_prefix}_window_token_scores.jsonl", window_token_rows
         )
@@ -1367,23 +1391,28 @@ def make_injected_metrics(rows, evaluation_name="injected_word_detection"):
         for outcome, predicate in (
             (
                 "tp",
-                lambda row: row["is_foreign_ground_truth"]
-                and row["is_foreign_predicted"],
+                lambda row: (
+                    row["is_foreign_ground_truth"] and row["is_foreign_predicted"]
+                ),
             ),
             (
                 "fp",
-                lambda row: not row["is_foreign_ground_truth"]
-                and row["is_foreign_predicted"],
+                lambda row: (
+                    not row["is_foreign_ground_truth"] and row["is_foreign_predicted"]
+                ),
             ),
             (
                 "tn",
-                lambda row: not row["is_foreign_ground_truth"]
-                and not row["is_foreign_predicted"],
+                lambda row: (
+                    not row["is_foreign_ground_truth"]
+                    and not row["is_foreign_predicted"]
+                ),
             ),
             (
                 "fn",
-                lambda row: row["is_foreign_ground_truth"]
-                and not row["is_foreign_predicted"],
+                lambda row: (
+                    row["is_foreign_ground_truth"] and not row["is_foreign_predicted"]
+                ),
             ),
         ):
             confidence = summarize_confidences(
@@ -1407,11 +1436,18 @@ def make_pure_window_metrics(rows):
                 row["model_family"],
                 row["true_lang"],
                 row["window_size"],
+                row["window_foreign_threshold"],
             )
         ].append(row)
 
     metrics = []
-    for (model, family, true_lang, window_size), group_rows in groups.items():
+    for (
+        model,
+        family,
+        true_lang,
+        window_size,
+        window_foreign_threshold,
+    ), group_rows in groups.items():
         foreign_predicted = sum(1 for row in group_rows if row["is_foreign_predicted"])
         foreign_probability = summarize_confidences(
             group_rows, key="foreign_probability"
@@ -1426,6 +1462,7 @@ def make_pure_window_metrics(rows):
                 "model_family": family,
                 "true_lang": true_lang,
                 "window_size": window_size,
+                "window_foreign_threshold": window_foreign_threshold,
                 "total": len(group_rows),
                 "foreign_false_positive_rate": (
                     foreign_predicted / len(group_rows) if group_rows else 0.0
@@ -1440,7 +1477,9 @@ def make_pure_window_metrics(rows):
     return metrics
 
 
-def make_injected_window_metrics(rows, evaluation_name="injected_window_token_detection"):
+def make_injected_window_metrics(
+    rows, evaluation_name="injected_window_token_detection"
+):
     groups = defaultdict(list)
     for row in rows:
         groups[
@@ -1449,11 +1488,18 @@ def make_injected_window_metrics(rows, evaluation_name="injected_window_token_de
                 row["model_family"],
                 row["injected_lang"],
                 row["window_size"],
+                row["window_foreign_threshold"],
             )
         ].append(row)
 
     metrics = []
-    for (model, family, injected_lang, window_size), group_rows in groups.items():
+    for (
+        model,
+        family,
+        injected_lang,
+        window_size,
+        window_foreign_threshold,
+    ), group_rows in groups.items():
         tp = sum(
             1
             for row in group_rows
@@ -1482,29 +1528,35 @@ def make_injected_window_metrics(rows, evaluation_name="injected_window_token_de
                 "model_family": family,
                 "injected_lang": injected_lang,
                 "window_size": window_size,
+                "window_foreign_threshold": window_foreign_threshold,
             }
         )
 
         for outcome, predicate in (
             (
                 "tp",
-                lambda row: row["is_foreign_ground_truth"]
-                and row["is_foreign_predicted"],
+                lambda row: (
+                    row["is_foreign_ground_truth"] and row["is_foreign_predicted"]
+                ),
             ),
             (
                 "fp",
-                lambda row: not row["is_foreign_ground_truth"]
-                and row["is_foreign_predicted"],
+                lambda row: (
+                    not row["is_foreign_ground_truth"] and row["is_foreign_predicted"]
+                ),
             ),
             (
                 "tn",
-                lambda row: not row["is_foreign_ground_truth"]
-                and not row["is_foreign_predicted"],
+                lambda row: (
+                    not row["is_foreign_ground_truth"]
+                    and not row["is_foreign_predicted"]
+                ),
             ),
             (
                 "fn",
-                lambda row: row["is_foreign_ground_truth"]
-                and not row["is_foreign_predicted"],
+                lambda row: (
+                    row["is_foreign_ground_truth"] and not row["is_foreign_predicted"]
+                ),
             ),
         ):
             confidence = summarize_confidences(
@@ -1591,10 +1643,10 @@ def write_run_metadata(args, models, output_dir, pure_configs):
     metadata = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "args": vars(args),
-        "models": [
-            {"name": model.name, "family": model.family}
-            for model in models
-        ],
+        "window_foreign_thresholds": parse_window_foreign_thresholds(
+            args.window_foreign_threshold
+        ),
+        "models": [{"name": model.name, "family": model.family} for model in models],
         "pure_configs": pure_configs,
         "language_mappings": ISO_639_3_TO_1,
     }
@@ -1605,7 +1657,9 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Evaluate language ID models for FLORES foreign-word detection."
     )
-    parser.add_argument("--output-dir", default="evaluation_results/flores_foreign_words")
+    parser.add_argument(
+        "--output-dir", default="evaluation_results/flores_foreign_words"
+    )
     parser.add_argument("--binary-model-root", default="models/spanish_binary_runs")
     parser.add_argument(
         "--models",
@@ -1637,14 +1691,15 @@ def parse_args():
     parser.add_argument("--skip-window", action="store_true")
     parser.add_argument(
         "--window-sizes",
-        default="2,3",
+        default="2,3,4,5",
         help="Comma-separated sliding context window sizes.",
     )
     parser.add_argument(
         "--window-foreign-threshold",
-        type=float,
-        default=0.5,
-        help="Foreign probability threshold for window token decisions.",
+        default="0.3,0.5,0.7",
+        help=(
+            "Comma-separated foreign probability thresholds for window token decisions."
+        ),
     )
     parser.add_argument(
         "--window-top-k",
@@ -1691,8 +1746,7 @@ def validate_args(args):
         raise ValueError("--phrase-span-min must be at least 1.")
     if args.phrase_span_max < args.phrase_span_min:
         raise ValueError("--phrase-span-max must be >= --phrase-span-min.")
-    if args.window_foreign_threshold < 0.0 or args.window_foreign_threshold > 1.0:
-        raise ValueError("--window-foreign-threshold must be in the range [0, 1].")
+    parse_window_foreign_thresholds(args.window_foreign_threshold)
     if args.window_top_k < 1:
         raise ValueError("--window-top-k must be at least 1.")
     window_sizes = parse_int_csv(args.window_sizes)
@@ -1700,7 +1754,10 @@ def validate_args(args):
         raise ValueError("--window-sizes must include at least one integer.")
     if any(window_size < 2 for window_size in window_sizes):
         raise ValueError("--window-sizes values must be at least 2.")
-    if args.limit_samples_per_language is not None and args.limit_samples_per_language < 1:
+    if (
+        args.limit_samples_per_language is not None
+        and args.limit_samples_per_language < 1
+    ):
         raise ValueError("--limit-samples-per-language must be at least 1.")
     if args.skip_pure and args.skip_injected and args.skip_phrase_swaps:
         raise ValueError("At least one evaluation dataset must run.")
