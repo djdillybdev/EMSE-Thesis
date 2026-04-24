@@ -31,7 +31,8 @@ DEFAULT_MODELS = (
     "spanish-binary-baseline,"
     "facebook-fasttext-language-identification,"
     "glotlid,"
-    "lingua"
+    "lingua,"
+    "lingua-spanish-only"
 )
 
 WHITESPACE_TOKEN_RE = re.compile(r"\S+")
@@ -67,6 +68,17 @@ ISO_639_3_TO_1 = {
     "kor": "ko",
     "ara": "ar",
     "hin": "hi",
+}
+
+LINGUA_LANGUAGES = {
+    "es": Language.SPANISH,
+    "en": Language.ENGLISH,
+    "pt": Language.PORTUGUESE,
+    "it": Language.ITALIAN,
+    "fr": Language.FRENCH,
+    "de": Language.GERMAN,
+    "ca": Language.CATALAN,
+    "eu": Language.BASQUE,
 }
 
 
@@ -264,10 +276,27 @@ def get_lingua_code(language):
     return language.name.lower()
 
 
-def build_lingua_detector():
-    if hasattr(LanguageDetectorBuilder, "from_all_languages"):
-        return LanguageDetectorBuilder.from_all_languages().build()
-    return LanguageDetectorBuilder.from_languages(*Language.all()).build()
+def selected_lingua_languages(args):
+    configs = set(parse_csv(DEFAULT_PURE_CONFIGS))
+    configs.update(parse_csv(args.injection_configs))
+    if args.flores_configs:
+        configs.update(parse_csv(args.flores_configs))
+    if args.limit_languages:
+        configs.update(parse_csv(args.limit_languages))
+
+    language_codes = {SPANISH}
+    for config in configs:
+        language_codes.add(config_to_lang(config))
+
+    return [
+        LINGUA_LANGUAGES[code]
+        for code in sorted(language_codes)
+        if code in LINGUA_LANGUAGES
+    ]
+
+
+def build_lingua_detector(languages):
+    return LanguageDetectorBuilder.from_languages(*languages).build()
 
 
 def lingua_supported_langs():
@@ -366,6 +395,40 @@ class LinguaAdapter(ModelAdapter):
         return build_window_score(self, main_lang, label_scores[:top_k])
 
 
+class LinguaSpanishOnlyAdapter(ModelAdapter):
+    def predict(self, text):
+        clean_text = (text or "").replace("\n", " ").strip()
+        if not clean_text:
+            return Prediction(self.name, self.family, "unknown", "unknown", 0.0)
+
+        detected = self.model.detect_language_of(clean_text)
+        if detected == Language.SPANISH:
+            return Prediction(self.name, self.family, SPANISH, SPANISH, 1.0)
+        return Prediction(self.name, self.family, NOT_SPANISH, NOT_SPANISH, 1.0)
+
+    def score_against_main_lang(self, text, main_lang, top_k):
+        prediction = self.predict(text)
+        main_lang_score = 1.0 if prediction.predicted_lang == main_lang else 0.0
+        foreign_score = 1.0 - main_lang_score
+        top_non_main_lang = (
+            prediction.predicted_lang
+            if prediction.predicted_lang != main_lang
+            else "unknown"
+        )
+        return WindowScore(
+            model=self.name,
+            model_family=self.family,
+            predicted_lang=prediction.predicted_lang,
+            predicted_label=prediction.predicted_label,
+            confidence=prediction.confidence,
+            main_lang=main_lang,
+            main_lang_score=main_lang_score,
+            foreign_score=foreign_score,
+            top_non_main_lang=top_non_main_lang,
+            top_non_main_confidence=foreign_score,
+        )
+
+
 def build_window_score(model, main_lang, label_scores):
     if not label_scores:
         return WindowScore(
@@ -458,9 +521,29 @@ def load_models(args):
             )
         )
 
+    lingua_languages = selected_lingua_languages(args)
     if not selected or "lingua" in selected:
-        log("Building Lingua detector")
-        models.append(LinguaAdapter("lingua", "lingua", build_lingua_detector()))
+        log(
+            "Building Lingua detector for "
+            f"{', '.join(get_lingua_code(language) for language in lingua_languages)}"
+        )
+        models.append(
+            LinguaAdapter(
+                "lingua",
+                "lingua",
+                build_lingua_detector(lingua_languages),
+            )
+        )
+
+    if not selected or "lingua-spanish-only" in selected:
+        log("Building Lingua Spanish-only detector")
+        models.append(
+            LinguaSpanishOnlyAdapter(
+                "lingua-spanish-only",
+                "lingua_binary",
+                build_lingua_detector([Language.SPANISH]),
+            )
+        )
 
     if selected:
         loaded = {model.name for model in models}
@@ -552,14 +635,14 @@ def prediction_record(prediction, extra):
 
 
 def is_prediction_correct(model, true_lang, predicted_lang):
-    if model.family == "spanish_binary":
+    if model.family in {"spanish_binary", "lingua_binary"}:
         expected = SPANISH if true_lang == SPANISH else NOT_SPANISH
         return predicted_lang == expected
     return predicted_lang == true_lang
 
 
 def is_foreign_detection(model, text_lang, word_prediction):
-    if model.family == "spanish_binary":
+    if model.family in {"spanish_binary", "lingua_binary"}:
         return word_prediction.predicted_lang == NOT_SPANISH
     return (
         text_lang != "unknown"
@@ -1488,7 +1571,7 @@ def build_supported_lang_map(models):
     lingua_langs = lingua_supported_langs()
     supported = {}
     for model in models:
-        if model.family == "spanish_binary":
+        if model.family in {"spanish_binary", "lingua_binary"}:
             supported[model.name] = {SPANISH, NOT_SPANISH}
         elif model.family == "lingua":
             supported[model.name] = lingua_langs
