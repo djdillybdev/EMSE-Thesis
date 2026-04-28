@@ -457,7 +457,10 @@ def build_window_score(model, main_lang, label_scores):
             top_non_main_lang = lang
             top_non_main_confidence = score
 
-    foreign_score = max(0.0, min(1.0, 1.0 - main_lang_score))
+    # For multi-language models, preserve both the total non-main mass and the
+    # strongest explicit non-main alternative when constructing foreignness.
+    foreign_score = max(1.0 - main_lang_score, top_non_main_confidence)
+    foreign_score = max(0.0, min(1.0, foreign_score))
     return WindowScore(
         model=model.name,
         model_family=model.family,
