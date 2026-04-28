@@ -844,9 +844,15 @@ def finalize_injected_metrics(groups, evaluation_name):
 
 def finalize_pure_window_metrics(groups):
     metrics = []
-    for (model, family, true_lang, window_size, threshold), group in sorted(
-        groups.items()
-    ):
+    for (
+        model,
+        family,
+        true_lang,
+        window_size,
+        decision_rule,
+        threshold,
+        shared_threshold,
+    ), group in sorted(groups.items()):
         metrics.append(
             {
                 "evaluation": "pure_window_token_detection",
@@ -854,7 +860,9 @@ def finalize_pure_window_metrics(groups):
                 "model_family": family,
                 "true_lang": true_lang,
                 "window_size": window_size,
+                "window_decision_rule": decision_rule,
                 "window_foreign_threshold": threshold,
+                "window_shared_foreign_threshold": shared_threshold,
                 "total": group["total"],
                 "foreign_false_positive_rate": (
                     group["foreign_predicted"] / group["total"]
@@ -879,7 +887,9 @@ def finalize_injected_window_metrics(groups, evaluation_name):
         family,
         injected_lang,
         window_size,
+        decision_rule,
         threshold,
+        shared_threshold,
     ), group in sorted(groups.items()):
         metric = classification_metrics(
             group["tp"], group["fp"], group["tn"], group["fn"]
@@ -891,7 +901,9 @@ def finalize_injected_window_metrics(groups, evaluation_name):
                 "model_family": family,
                 "injected_lang": injected_lang,
                 "window_size": window_size,
+                "window_decision_rule": decision_rule,
                 "window_foreign_threshold": threshold,
+                "window_shared_foreign_threshold": shared_threshold,
                 "tp_foreign_probability_mean": stats_mean(
                     group["tp_foreign_probability"]
                 ),
@@ -950,6 +962,21 @@ def parse_float_csv(value):
     return [float(item) for item in parse_csv(str(value))]
 
 
+def parse_window_decision_modes(value):
+    modes = parse_csv(value)
+    if not modes:
+        raise ValueError("--window-decision-modes must include at least one mode.")
+
+    allowed = {"legacy_window", "contextual_hybrid"}
+    invalid = sorted(set(modes) - allowed)
+    if invalid:
+        raise ValueError(
+            "--window-decision-modes contains unsupported value(s): "
+            + ", ".join(invalid)
+        )
+    return modes
+
+
 def parse_window_foreign_thresholds(value):
     thresholds = parse_float_csv(value)
     if not thresholds:
@@ -957,6 +984,26 @@ def parse_window_foreign_thresholds(value):
     if any(threshold < 0.0 or threshold > 1.0 for threshold in thresholds):
         raise ValueError("--window-foreign-threshold must be in the range [0, 1].")
     return thresholds
+
+
+def validate_probability_thresholds(values, flag_name):
+    if not values:
+        raise ValueError(f"{flag_name} must include at least one float.")
+    if any(value < 0.0 or value > 1.0 for value in values):
+        raise ValueError(f"{flag_name} must be in the range [0, 1].")
+    return values
+
+
+def parse_window_contextual_thresholds(value):
+    return validate_probability_thresholds(
+        parse_float_csv(value), "--window-contextual-threshold"
+    )
+
+
+def parse_window_shared_foreign_thresholds(value):
+    return validate_probability_thresholds(
+        parse_float_csv(value), "--window-shared-foreign-threshold"
+    )
 
 
 def window_score_record(score, extra):
@@ -991,12 +1038,28 @@ def build_window_rows_and_token_scores(
     token_injections=None,
     include_window_rows=True,
     window_row_writer=None,
+    decision_modes=("legacy_window",),
+    contextual_thresholds=None,
+    shared_foreign_thresholds=None,
+    shared_foreign_min_window_count=1,
+    shared_foreign_min_ratio=0.5,
 ):
     token_injections = token_injections or {}
+    contextual_thresholds = contextual_thresholds or ()
+    shared_foreign_thresholds = shared_foreign_thresholds or ()
     token_score_inputs = defaultdict(
         lambda: {"foreign_sum": 0.0, "main_sum": 0.0, "count": 0}
     )
     tokens_by_raw_index = {token.raw_index: token for token in tokens}
+    token_positions = {
+        token.raw_index: position for position, token in enumerate(tokens)
+    }
+    token_self_scores = {
+        token.raw_index: model.score_against_main_lang(
+            token.normalized, main_lang, top_k
+        )
+        for token in tokens
+    }
 
     for window_size in window_sizes:
         if len(tokens) < window_size:
@@ -1041,39 +1104,280 @@ def build_window_rows_and_token_scores(
         token_item = tokens_by_raw_index[token_index]
         foreign_probability = aggregate["foreign_sum"] / aggregate["count"]
         main_lang_probability = aggregate["main_sum"] / aggregate["count"]
+        window_margin = foreign_probability - main_lang_probability
+        self_score = token_self_scores[token_index]
+        self_main_lang_probability = self_score.main_lang_score
+        self_foreign_probability = self_score.foreign_score
+        self_margin = self_foreign_probability - self_main_lang_probability
+        neighbor_scores = build_neighbor_margin_scores(
+            tokens=tokens,
+            token_positions=token_positions,
+            token_self_scores=token_self_scores,
+            token_index=token_index,
+            window_size=window_size,
+        )
+        neighbor_margin_baseline = weighted_median(neighbor_scores)
+        contextual_margin_delta = self_margin - neighbor_margin_baseline
+        neighbor_count = len(neighbor_scores)
+        shared_window_weight_sum = sum(weight for _value, weight in neighbor_scores)
         injection = token_injections.get(token_index, {})
         truth = token_truth(token_index)
-        for threshold in thresholds:
-            # predicted = foreign_probability >= threshold # first run check
-            predicted = (
-                foreign_probability / main_lang_probability >= threshold
-                if main_lang_probability > 0
-                else foreign_probability >= threshold
-            )
-            
-            yield {
-                **base_extra,
-                "model": model.name,
-                "model_family": model.family,
-                "detection_method": "window",
-                "window_size": window_size,
-                "token_index": token_item.raw_index,
-                "token": token_item.raw,
-                "normalized_token": token_item.normalized,
-                "main_lang": main_lang,
-                "main_lang_probability": main_lang_probability,
-                "foreign_probability": foreign_probability,
-                "window_count": aggregate["count"],
-                "window_foreign_threshold": threshold,
-                "is_foreign_ground_truth": truth,
-                "is_foreign_predicted": predicted,
-                "correct": truth == predicted,
-                "original_normalized": injection.get("original_normalized"),
-                "replacement_normalized": injection.get("replacement_normalized"),
-                "span_id": injection.get("span_id"),
-                "span_offset": injection.get("span_offset"),
-                "span_length": injection.get("span_length"),
+        base_row = {
+            **base_extra,
+            "model": model.name,
+            "model_family": model.family,
+            "detection_method": "window",
+            "window_size": window_size,
+            "token_index": token_item.raw_index,
+            "token": token_item.raw,
+            "normalized_token": token_item.normalized,
+            "main_lang": main_lang,
+            "main_lang_probability": main_lang_probability,
+            "foreign_probability": foreign_probability,
+            "window_count": aggregate["count"],
+            "window_margin": window_margin,
+            "self_main_lang_probability": self_main_lang_probability,
+            "self_foreign_probability": self_foreign_probability,
+            "self_margin": self_margin,
+            "neighbor_margin_baseline": neighbor_margin_baseline,
+            "contextual_margin_delta": contextual_margin_delta,
+            "neighbor_count": neighbor_count,
+            "shared_window_weight_sum": shared_window_weight_sum,
+            "original_normalized": injection.get("original_normalized"),
+            "replacement_normalized": injection.get("replacement_normalized"),
+            "span_id": injection.get("span_id"),
+            "span_offset": injection.get("span_offset"),
+            "span_length": injection.get("span_length"),
+        }
+        for mode in decision_modes:
+            for threshold in thresholds_for_mode(
+                mode, thresholds, contextual_thresholds
+            ):
+                predicted = predict_window_token_foreign(
+                    mode=mode,
+                    main_lang_probability=main_lang_probability,
+                    foreign_probability=foreign_probability,
+                    contextual_margin_delta=contextual_margin_delta,
+                    threshold=threshold,
+                )
+
+                row = {
+                    **base_row,
+                    "window_decision_rule": mode,
+                    "window_foreign_threshold": threshold,
+                    "window_shared_foreign_threshold": None,
+                    "window_shared_foreign_min_window_count": None,
+                    "window_shared_foreign_min_ratio": None,
+                    "shared_foreign_window_count": 0,
+                    "shared_foreign_window_ratio": 0.0,
+                    "consensus_run_length": 0,
+                    "is_foreign_ground_truth": truth,
+                    "is_foreign_predicted": predicted,
+                    "correct": truth == predicted,
+                }
+                yield row
+
+            if mode == "contextual_hybrid":
+                for threshold in contextual_thresholds:
+                    for shared_threshold in shared_foreign_thresholds:
+                        yield from build_contextual_hybrid_rows(
+                            tokens=tokens,
+                            tokens_by_raw_index=tokens_by_raw_index,
+                            token_truth=token_truth,
+                            token_injections=token_injections,
+                            base_row=base_row,
+                            base_extra=base_extra,
+                            model=model,
+                            main_lang=main_lang,
+                            window_size=window_size,
+                            token_score_inputs=token_score_inputs,
+                            contextual_threshold=threshold,
+                            shared_foreign_threshold=shared_threshold,
+                            shared_foreign_min_window_count=shared_foreign_min_window_count,
+                            shared_foreign_min_ratio=shared_foreign_min_ratio,
+                        )
+                break
+
+
+def shared_window_count(sequence_length, window_size, left_index, right_index):
+    min_start = max(0, max(left_index, right_index) - window_size + 1)
+    max_start = min(min(left_index, right_index), sequence_length - window_size)
+    if max_start < min_start:
+        return 0
+    return max_start - min_start + 1
+
+
+def build_neighbor_margin_scores(
+    *,
+    tokens,
+    token_positions,
+    token_self_scores,
+    token_index,
+    window_size,
+):
+    sequence_length = len(tokens)
+    source_position = token_positions[token_index]
+    scores = []
+    for neighbor in tokens:
+        if neighbor.raw_index == token_index:
+            continue
+        neighbor_position = token_positions[neighbor.raw_index]
+        weight = shared_window_count(
+            sequence_length, window_size, source_position, neighbor_position
+        )
+        if weight <= 0:
+            continue
+        neighbor_score = token_self_scores[neighbor.raw_index]
+        neighbor_margin = neighbor_score.foreign_score - neighbor_score.main_lang_score
+        scores.append((neighbor_margin, weight))
+    return scores
+
+
+def weighted_median(values):
+    if not values:
+        return 0.0
+    sorted_values = sorted(values, key=lambda item: item[0])
+    total_weight = sum(weight for _value, weight in sorted_values)
+    midpoint = total_weight / 2.0
+    running_weight = 0.0
+    for value, weight in sorted_values:
+        running_weight += weight
+        if running_weight >= midpoint:
+            return value
+    return sorted_values[-1][0]
+
+
+def thresholds_for_mode(mode, legacy_thresholds, contextual_thresholds):
+    if mode == "legacy_window":
+        return legacy_thresholds
+    if mode == "contextual_hybrid":
+        return ()
+    raise ValueError(f"Unsupported window decision mode: {mode}")
+
+
+def predict_window_token_foreign(
+    *,
+    mode,
+    main_lang_probability,
+    foreign_probability,
+    contextual_margin_delta,
+    threshold,
+):
+    if mode == "legacy_window":
+        return foreign_probability >= threshold
+    if mode == "contextual_hybrid":
+        return contextual_margin_delta >= threshold
+    raise ValueError(f"Unsupported window decision mode: {mode}")
+
+
+def build_contextual_hybrid_rows(
+    *,
+    tokens,
+    tokens_by_raw_index,
+    token_truth,
+    token_injections,
+    base_row,
+    base_extra,
+    model,
+    main_lang,
+    window_size,
+    token_score_inputs,
+    contextual_threshold,
+    shared_foreign_threshold,
+    shared_foreign_min_window_count,
+    shared_foreign_min_ratio,
+):
+    per_token = []
+    for token in tokens:
+        aggregate = token_score_inputs[(window_size, token.raw_index)]
+        foreign_probability = aggregate["foreign_sum"] / aggregate["count"]
+        main_lang_probability = aggregate["main_sum"] / aggregate["count"]
+        window_margin = foreign_probability - main_lang_probability
+        shared_foreign_window_count = int(window_margin >= shared_foreign_threshold)
+        shared_foreign_window_ratio = (
+            shared_foreign_window_count / aggregate["count"]
+            if aggregate["count"]
+            else 0.0
+        )
+        per_token.append(
+            {
+                "token_index": token.raw_index,
+                "window_margin": window_margin,
+                "shared_foreign_window_count": shared_foreign_window_count,
+                "shared_foreign_window_ratio": shared_foreign_window_ratio,
+                "eligible_for_shared_foreign": (
+                    shared_foreign_window_count >= shared_foreign_min_window_count
+                    and shared_foreign_window_ratio >= shared_foreign_min_ratio
+                ),
             }
+        )
+
+    run_lengths = {}
+    run_start = 0
+    while run_start < len(per_token):
+        if not per_token[run_start]["eligible_for_shared_foreign"]:
+            run_lengths[per_token[run_start]["token_index"]] = 0
+            run_start += 1
+            continue
+        run_end = run_start
+        while (
+            run_end + 1 < len(per_token)
+            and per_token[run_end + 1]["eligible_for_shared_foreign"]
+        ):
+            run_end += 1
+        run_length = run_end - run_start + 1
+        for item in per_token[run_start : run_end + 1]:
+            run_lengths[item["token_index"]] = run_length
+        run_start = run_end + 1
+
+    token_lookup = {item["token_index"]: item for item in per_token}
+    token_index = base_row["token_index"]
+    token_state = token_lookup[token_index]
+    predicted = base_row["contextual_margin_delta"] >= contextual_threshold or (
+        base_row["contextual_margin_delta"] > -contextual_threshold
+        and run_lengths[token_index] >= 2
+    )
+    truth = token_truth(token_index)
+    injection = token_injections.get(token_index, {})
+
+    yield {
+        **base_extra,
+        "model": model.name,
+        "model_family": model.family,
+        "detection_method": "window",
+        "window_size": window_size,
+        "token_index": token_index,
+        "token": tokens_by_raw_index[token_index].raw,
+        "normalized_token": tokens_by_raw_index[token_index].normalized,
+        "main_lang": main_lang,
+        "main_lang_probability": base_row["main_lang_probability"],
+        "foreign_probability": base_row["foreign_probability"],
+        "window_count": base_row["window_count"],
+        "window_margin": token_state["window_margin"],
+        "self_main_lang_probability": base_row["self_main_lang_probability"],
+        "self_foreign_probability": base_row["self_foreign_probability"],
+        "self_margin": base_row["self_margin"],
+        "neighbor_margin_baseline": base_row["neighbor_margin_baseline"],
+        "contextual_margin_delta": base_row["contextual_margin_delta"],
+        "neighbor_count": base_row["neighbor_count"],
+        "shared_window_weight_sum": base_row["shared_window_weight_sum"],
+        "window_decision_rule": "contextual_hybrid",
+        "window_foreign_threshold": contextual_threshold,
+        "window_shared_foreign_threshold": shared_foreign_threshold,
+        "window_shared_foreign_min_window_count": shared_foreign_min_window_count,
+        "window_shared_foreign_min_ratio": shared_foreign_min_ratio,
+        "shared_foreign_window_count": token_state["shared_foreign_window_count"],
+        "shared_foreign_window_ratio": token_state["shared_foreign_window_ratio"],
+        "consensus_run_length": run_lengths[token_index],
+        "is_foreign_ground_truth": truth,
+        "is_foreign_predicted": predicted,
+        "correct": truth == predicted,
+        "original_normalized": injection.get("original_normalized"),
+        "replacement_normalized": injection.get("replacement_normalized"),
+        "span_id": injection.get("span_id"),
+        "span_offset": injection.get("span_offset"),
+        "span_length": injection.get("span_length"),
+    }
 
 
 def run_pure_evaluation(args, models, token, supported_langs):
@@ -1110,7 +1414,14 @@ def run_pure_evaluation(args, models, token, supported_langs):
         }
     )
     window_sizes = parse_int_csv(args.window_sizes)
+    window_decision_modes = parse_window_decision_modes(args.window_decision_modes)
     window_thresholds = parse_window_foreign_thresholds(args.window_foreign_threshold)
+    window_contextual_thresholds = parse_window_contextual_thresholds(
+        args.window_contextual_threshold
+    )
+    window_shared_foreign_thresholds = parse_window_shared_foreign_thresholds(
+        args.window_shared_foreign_threshold
+    )
     text_writer = JsonlStreamWriter(
         text_path,
         enabled=not only_window,
@@ -1195,6 +1506,11 @@ def run_pure_evaluation(args, models, token, supported_langs):
                                 args.save_window_raw
                             ),
                             window_row_writer=window_writer,
+                            decision_modes=window_decision_modes,
+                            contextual_thresholds=window_contextual_thresholds,
+                            shared_foreign_thresholds=window_shared_foreign_thresholds,
+                            shared_foreign_min_window_count=args.window_shared_foreign_min_window_count,
+                            shared_foreign_min_ratio=args.window_shared_foreign_min_ratio,
                         ):
                             window_group = pure_window_groups[
                                 (
@@ -1202,7 +1518,9 @@ def run_pure_evaluation(args, models, token, supported_langs):
                                     window_token_row["model_family"],
                                     window_token_row["true_lang"],
                                     window_token_row["window_size"],
+                                    window_token_row["window_decision_rule"],
                                     window_token_row["window_foreign_threshold"],
+                                    window_token_row["window_shared_foreign_threshold"],
                                 )
                             ]
                             window_group["total"] += 1
@@ -1268,9 +1586,7 @@ def run_pure_evaluation(args, models, token, supported_langs):
         window_token_writer.close()
 
     return (
-        []
-        if only_window
-        else finalize_pure_metrics(pure_metrics_groups)
+        [] if only_window else finalize_pure_metrics(pure_metrics_groups)
     ), finalize_pure_window_metrics(pure_window_groups)
 
 
@@ -1588,7 +1904,14 @@ def run_mixed_evaluation(args, models, sample_filename, output_prefix, evaluatio
         }
     )
     window_sizes = parse_int_csv(args.window_sizes)
+    window_decision_modes = parse_window_decision_modes(args.window_decision_modes)
     window_thresholds = parse_window_foreign_thresholds(args.window_foreign_threshold)
+    window_contextual_thresholds = parse_window_contextual_thresholds(
+        args.window_contextual_threshold
+    )
+    window_shared_foreign_thresholds = parse_window_shared_foreign_thresholds(
+        args.window_shared_foreign_threshold
+    )
     word_writer = JsonlStreamWriter(
         output_dir / f"{output_prefix}_word_predictions.jsonl",
         enabled=not only_window,
@@ -1682,6 +2005,11 @@ def run_mixed_evaluation(args, models, sample_filename, output_prefix, evaluatio
                                 args.save_window_raw
                             ),
                             window_row_writer=window_writer,
+                            decision_modes=window_decision_modes,
+                            contextual_thresholds=window_contextual_thresholds,
+                            shared_foreign_thresholds=window_shared_foreign_thresholds,
+                            shared_foreign_min_window_count=args.window_shared_foreign_min_window_count,
+                            shared_foreign_min_ratio=args.window_shared_foreign_min_ratio,
                         ):
                             window_group = window_groups[
                                 (
@@ -1689,7 +2017,9 @@ def run_mixed_evaluation(args, models, sample_filename, output_prefix, evaluatio
                                     window_token_row["model_family"],
                                     window_token_row["injected_lang"],
                                     window_token_row["window_size"],
+                                    window_token_row["window_decision_rule"],
                                     window_token_row["window_foreign_threshold"],
+                                    window_token_row["window_shared_foreign_threshold"],
                                 )
                             ]
                             outcome = update_outcome_counts(
@@ -1764,9 +2094,7 @@ def run_mixed_evaluation(args, models, sample_filename, output_prefix, evaluatio
         window_token_writer.close()
 
     return (
-        []
-        if only_window
-        else finalize_injected_metrics(word_groups, evaluation_name)
+        [] if only_window else finalize_injected_metrics(word_groups, evaluation_name)
     ), finalize_injected_window_metrics(
         window_groups, f"{output_prefix}_window_token_detection"
     )
@@ -1832,9 +2160,7 @@ def write_metrics(
         write_csv(output_dir / "phrase_detection_metrics.csv", phrase_metrics)
         summary["phrase"] = phrase_metrics
     if pure_window_metrics:
-        write_csv(
-            output_dir / "pure_window_detection_metrics.csv", pure_window_metrics
-        )
+        write_csv(output_dir / "pure_window_detection_metrics.csv", pure_window_metrics)
         summary["pure_window"] = pure_window_metrics
     if injected_window_metrics:
         write_csv(
@@ -1876,8 +2202,17 @@ def write_run_metadata(args, models, output_dir, pure_configs):
     metadata = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "args": vars(args),
+        "window_decision_modes": parse_window_decision_modes(
+            args.window_decision_modes
+        ),
         "window_foreign_thresholds": parse_window_foreign_thresholds(
             args.window_foreign_threshold
+        ),
+        "window_contextual_thresholds": parse_window_contextual_thresholds(
+            args.window_contextual_threshold
+        ),
+        "window_shared_foreign_thresholds": parse_window_shared_foreign_thresholds(
+            args.window_shared_foreign_threshold
         ),
         "models": [{"name": model.name, "family": model.family} for model in models],
         "pure_configs": pure_configs,
@@ -1891,7 +2226,8 @@ def parse_args():
         description="Evaluate language ID models for FLORES foreign-word detection."
     )
     parser.add_argument(
-        "--output-dir", default="evaluation_results/flores_foreign_words_run2"
+        "--output-dir",
+        default="evaluation_results/flores_foreign_words_run_method_difference",
     )
     parser.add_argument("--binary-model-root", default="models/spanish_binary_runs")
     parser.add_argument(
@@ -1960,15 +2296,42 @@ def parse_args():
     )
     parser.add_argument(
         "--window-sizes",
-        default="2,3,4,5,6",
+        default="2,3,4",
         help="Comma-separated sliding context window sizes.",
     )
     parser.add_argument(
         "--window-foreign-threshold",
-        default="0.3,0.5,0.7,0.8,0.9",
+        default="0.3,0.5,0.7",
         help=(
             "Comma-separated foreign probability thresholds for window token decisions."
         ),
+    )
+    parser.add_argument(
+        "--window-decision-modes",
+        default="legacy_window,contextual_hybrid",
+        help="Comma-separated window token decision rules to run side by side.",
+    )
+    parser.add_argument(
+        "--window-contextual-threshold",
+        default="0.2",
+        help="Comma-separated contextual outlier thresholds for contextual window mode.",
+    )
+    parser.add_argument(
+        "--window-shared-foreign-threshold",
+        default="0.15",
+        help="Comma-separated shared foreign-margin thresholds for consensus fallback.",
+    )
+    parser.add_argument(
+        "--window-shared-foreign-min-window-count",
+        type=int,
+        default=1,
+        help="Minimum shared foreign window count required before consensus can fire.",
+    )
+    parser.add_argument(
+        "--window-shared-foreign-min-ratio",
+        type=float,
+        default=0.5,
+        help="Minimum shared foreign window ratio required before consensus can fire.",
     )
     parser.add_argument(
         "--window-top-k",
@@ -2015,9 +2378,21 @@ def validate_args(args):
         raise ValueError("--phrase-span-min must be at least 1.")
     if args.phrase_span_max < args.phrase_span_min:
         raise ValueError("--phrase-span-max must be >= --phrase-span-min.")
+    parse_window_decision_modes(args.window_decision_modes)
     parse_window_foreign_thresholds(args.window_foreign_threshold)
+    parse_window_contextual_thresholds(args.window_contextual_threshold)
+    parse_window_shared_foreign_thresholds(args.window_shared_foreign_threshold)
     if args.window_top_k < 1:
         raise ValueError("--window-top-k must be at least 1.")
+    if args.window_shared_foreign_min_window_count < 1:
+        raise ValueError("--window-shared-foreign-min-window-count must be at least 1.")
+    if (
+        args.window_shared_foreign_min_ratio <= 0.0
+        or args.window_shared_foreign_min_ratio > 1.0
+    ):
+        raise ValueError(
+            "--window-shared-foreign-min-ratio must be in the range (0, 1]."
+        )
     window_sizes = parse_int_csv(args.window_sizes)
     if not window_sizes:
         raise ValueError("--window-sizes must include at least one integer.")
