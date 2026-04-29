@@ -2230,7 +2230,7 @@ def parse_args():
     )
     parser.add_argument(
         "--output-dir",
-        default="evaluation_results/flores_foreign_words_run_method_difference",
+        default="evaluation_results/flores_foreign_words_run_contextual_values",
     )
     parser.add_argument("--binary-model-root", default="models/spanish_binary_runs")
     parser.add_argument(
@@ -2299,7 +2299,7 @@ def parse_args():
     )
     parser.add_argument(
         "--window-sizes",
-        default="2,3,4",
+        default="2,3",
         help="Comma-separated sliding context window sizes.",
     )
     parser.add_argument(
