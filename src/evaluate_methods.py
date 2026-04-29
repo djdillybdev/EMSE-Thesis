@@ -2,7 +2,6 @@ import argparse
 import csv
 import json
 import os
-import random
 import re
 import time
 from collections import defaultdict
@@ -11,22 +10,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import fasttext
-from datasets import load_dataset
 from huggingface_hub import hf_hub_download
 from lingua import Language, LanguageDetectorBuilder
+from prepare_data import (
+    load_prepared_datasets_from_dir,
+    prepared_manifest_summary,
+)
 
 
 FASTTEXT_LABEL_PREFIX = "__label__"
 SPANISH = "es"
 NOT_SPANISH = "not_es"
 
-DEFAULT_FLORES_DATASET = "openlanguagedata/flores_plus"
-DEFAULT_SPLIT = "devtest"
-DEFAULT_SPANISH_CONFIG = "spa_Latn"
-DEFAULT_INJECTION_CONFIGS = (
-    "eng_Latn,por_Latn,ita_Latn,fra_Latn,deu_Latn,cat_Latn,eus_Latn"
-)
-DEFAULT_PURE_CONFIGS = f"{DEFAULT_SPANISH_CONFIG},{DEFAULT_INJECTION_CONFIGS}"
 DEFAULT_MODELS = (
     "spanish-binary-baseline,facebook-fasttext-language-identification,glotlid,"
     "lingua,lingua-spanish-only"
@@ -170,10 +165,6 @@ def load_env_file(path):
     return loaded_keys
 
 
-def dataset_kwargs(token):
-    return {"token": token} if token else {}
-
-
 def normalize_lang_code(label):
     code = (label or "").replace(FASTTEXT_LABEL_PREFIX, "").strip()
     if not code:
@@ -188,22 +179,6 @@ def normalize_lang_code(label):
 
     lowered = code.lower()
     return ISO_639_3_TO_1.get(lowered, lowered)
-
-
-def config_to_lang(config):
-    return normalize_lang_code(config)
-
-
-def text_from_row(row):
-    if "text" in row and row["text"] is not None:
-        return str(row["text"])
-    if "sentence" in row and row["sentence"] is not None:
-        return str(row["sentence"])
-    if "translation" in row and isinstance(row["translation"], dict):
-        values = [value for value in row["translation"].values() if value]
-        if values:
-            return str(values[0])
-    raise KeyError("Unable to find a text field in FLORES row.")
 
 
 def strip_token(raw):
@@ -273,17 +248,12 @@ def get_lingua_code(language):
     return language.name.lower()
 
 
-def selected_lingua_languages(args):
-    configs = set(parse_csv(DEFAULT_PURE_CONFIGS))
-    configs.update(parse_csv(args.injection_configs))
-    if args.flores_configs:
-        configs.update(parse_csv(args.flores_configs))
-    if args.limit_languages:
-        configs.update(parse_csv(args.limit_languages))
-
+def selected_lingua_languages(prepared_manifest):
+    configs = set(prepared_manifest["pure_configs"])
+    configs.update(prepared_manifest["injection_configs"])
     language_codes = {SPANISH}
     for config in configs:
-        language_codes.add(config_to_lang(config))
+        language_codes.add(normalize_lang_code(config))
 
     return [
         LINGUA_LANGUAGES[code]
@@ -487,7 +457,7 @@ def load_fasttext_hf_model(repo_id, filename):
     return fasttext.load_model(hf_hub_download(repo_id=repo_id, filename=filename))
 
 
-def load_models(args):
+def load_models(args, prepared_manifest):
     selected = set(parse_csv(args.models)) if args.models else None
     models = []
     fasttext.FastText.eprint = lambda _message: None
@@ -525,7 +495,7 @@ def load_models(args):
             )
         )
 
-    lingua_languages = selected_lingua_languages(args)
+    lingua_languages = selected_lingua_languages(prepared_manifest)
     if not selected or "lingua" in selected:
         log(
             "Building Lingua detector for "
@@ -560,42 +530,6 @@ def load_models(args):
     if not models:
         raise RuntimeError("No models were loaded.")
     return models
-
-
-def load_flores_samples(dataset_name, config, split, token, limit=None):
-    return list(iter_flores_samples(dataset_name, config, split, token, limit))
-
-
-def iter_flores_samples(dataset_name, config, split, token, limit=None):
-    log(f"Loading FLORES {config}/{split}")
-    dataset = load_dataset(dataset_name, config, split=split, **dataset_kwargs(token))
-    lang = config_to_lang(config)
-    for index, row in enumerate(dataset):
-        yield Sample(
-            sample_id=f"{config}:{split}:{index}",
-            row_index=index,
-            flores_config=config,
-            lang=lang,
-            text=text_from_row(row),
-        )
-        if limit and index + 1 >= limit:
-            break
-
-
-def resolve_pure_configs(args, token):
-    if args.flores_configs:
-        configs = parse_csv(args.flores_configs)
-    else:
-        configs = parse_csv(DEFAULT_PURE_CONFIGS)
-
-    if args.limit_languages:
-        wanted = set(parse_csv(args.limit_languages))
-        configs = [
-            config
-            for config in configs
-            if config in wanted or config_to_lang(config) in wanted
-        ]
-    return sorted(configs)
 
 
 def write_json(path, data):
@@ -653,9 +587,15 @@ class JsonlStreamWriter:
 
 
 def should_save_raw_row(row, save_raw_level):
+    if save_raw_level == "none":
+        return False
     if save_raw_level in {"token_full", "all_raw"}:
         return True
     return not row.get("correct", True)
+
+
+def should_save_prediction_rows(save_raw_level):
+    return save_raw_level != "none"
 
 
 def should_save_window_token_rows(save_window_raw):
@@ -690,69 +630,6 @@ def slim_window_token_row(row, save_raw_level):
         ):
             slim.pop(key, None)
     return slim
-
-
-def serialize_mixed_sample(sample, save_sample_text):
-    saved = {
-        "sample_id": sample["sample_id"],
-        "source_sample_id": sample["source_sample_id"],
-        "row_index": sample["row_index"],
-        "split": sample["split"],
-        "source_config": sample["source_config"],
-        "base_lang": sample["base_lang"],
-        "injected_lang": sample["injected_lang"],
-        "contamination_type": sample["contamination_type"],
-        "injection_ratio": sample["injection_ratio"],
-        "requested_injections": sample["requested_injections"],
-        "actual_injections": sample["actual_injections"],
-        "injections": sample["injections"],
-    }
-    if "phrase_span_min" in sample:
-        saved["phrase_span_min"] = sample["phrase_span_min"]
-    if "phrase_span_max" in sample:
-        saved["phrase_span_max"] = sample["phrase_span_max"]
-
-    if save_sample_text in {"mixed_only", "all_text"}:
-        saved["text"] = sample["text"]
-    if save_sample_text == "all_text":
-        saved["original_text"] = sample["original_text"]
-        saved["foreign_text"] = sample["foreign_text"]
-    return saved
-
-
-def reconstruct_mixed_text(sample, source_text):
-    raw_parts = raw_text_parts(source_text)
-    for injection in sample["injections"]:
-        raw_parts[injection["token_index"]] = injection["replacement_token"]
-    return " ".join(raw_parts)
-
-
-def load_flores_sample_lookup(dataset_name, config, split, token, row_indexes):
-    if not row_indexes:
-        return {}
-
-    wanted = set(row_indexes)
-    if not wanted:
-        return {}
-
-    max_index = max(wanted)
-    dataset = load_dataset(dataset_name, config, split=split, **dataset_kwargs(token))
-    lang = config_to_lang(config)
-    samples = {}
-    for index, row in enumerate(dataset):
-        if index in wanted:
-            samples[index] = Sample(
-                sample_id=f"{config}:{split}:{index}",
-                row_index=index,
-                flores_config=config,
-                lang=lang,
-                text=text_from_row(row),
-            )
-            if len(samples) == len(wanted):
-                break
-        if index >= max_index:
-            break
-    return samples
 
 
 def new_stats():
@@ -1383,7 +1260,7 @@ def build_contextual_hybrid_rows(
     }
 
 
-def run_pure_evaluation(args, models, token, supported_langs):
+def run_pure_evaluation(args, models, pure_samples, supported_langs):
     output_dir = Path(args.output_dir)
     text_path = output_dir / "pure_text_predictions.jsonl"
     word_path = output_dir / "pure_word_predictions.jsonl"
@@ -1391,9 +1268,8 @@ def run_pure_evaluation(args, models, token, supported_langs):
     pure_window_token_path = output_dir / "pure_window_token_scores.jsonl"
     only_window = args.only_window
 
-    configs = resolve_pure_configs(args, token)
-    if not configs:
-        raise RuntimeError("No FLORES configs selected for pure evaluation.")
+    if not pure_samples:
+        raise RuntimeError("No prepared pure samples were loaded.")
 
     pure_metrics_groups = {
         "text": defaultdict(
@@ -1427,12 +1303,12 @@ def run_pure_evaluation(args, models, token, supported_langs):
     )
     text_writer = JsonlStreamWriter(
         text_path,
-        enabled=not only_window,
+        enabled=not only_window and should_save_prediction_rows(args.save_raw_level),
         transform=slim_prediction_row,
     )
     word_writer = JsonlStreamWriter(
         word_path,
-        enabled=not only_window,
+        enabled=not only_window and should_save_prediction_rows(args.save_raw_level),
         transform=slim_prediction_row,
     )
     window_writer = JsonlStreamWriter(
@@ -1448,140 +1324,131 @@ def run_pure_evaluation(args, models, token, supported_langs):
     )
 
     try:
-        for config in configs:
-            for sample in iter_flores_samples(
-                args.flores_dataset,
-                config,
-                args.split,
-                token,
-                args.limit_samples_per_language,
-            ):
-                tokens = tokenize(sample.text)
-                for model in models:
-                    text_prediction = model.predict(sample.text)
-                    base_extra = {
-                        "sample_id": sample.sample_id,
-                        "row_index": sample.row_index,
-                        "flores_config": sample.flores_config,
-                        "true_lang": sample.lang,
-                        "text_predicted_lang": text_prediction.predicted_lang,
-                        "is_supported_target": is_supported_target(
-                            supported_langs, model.name, sample.lang
+        for sample in pure_samples:
+            tokens = tokenize(sample.text)
+            for model in models:
+                text_prediction = model.predict(sample.text)
+                base_extra = {
+                    "sample_id": sample.sample_id,
+                    "row_index": sample.row_index,
+                    "flores_config": sample.flores_config,
+                    "true_lang": sample.lang,
+                    "text_predicted_lang": text_prediction.predicted_lang,
+                    "is_supported_target": is_supported_target(
+                        supported_langs, model.name, sample.lang
+                    ),
+                }
+                text_row = prediction_record(
+                    text_prediction,
+                    {
+                        **base_extra,
+                        "input_level": "text",
+                        "text_length_chars": len(sample.text),
+                        "text_length_words": len(tokens),
+                        "correct": is_prediction_correct(
+                            model, sample.lang, text_prediction.predicted_lang
                         ),
-                    }
-                    text_row = prediction_record(
-                        text_prediction,
-                        {
+                    },
+                )
+                if not only_window:
+                    text_group = pure_metrics_groups["text"][
+                        (model.name, model.family, sample.lang)
+                    ]
+                    text_group["total"] += 1
+                    text_group["correct"] += int(text_row["correct"])
+                    update_stats(text_group["confidence"], text_row["confidence"])
+                    if should_save_raw_row(text_row, args.save_raw_level):
+                        text_writer.write(text_row)
+
+                if not args.skip_window:
+                    for window_token_row in build_window_rows_and_token_scores(
+                        sample=sample,
+                        tokens=tokens,
+                        model=model,
+                        main_lang=text_prediction.predicted_lang,
+                        window_sizes=window_sizes,
+                        thresholds=window_thresholds,
+                        top_k=args.window_top_k,
+                        base_extra={
                             **base_extra,
-                            "input_level": "text",
-                            "text_length_chars": len(sample.text),
-                            "text_length_words": len(tokens),
-                            "correct": is_prediction_correct(
-                                model, sample.lang, text_prediction.predicted_lang
-                            ),
+                            "input_level": "window",
                         },
-                    )
-                    if not only_window:
-                        text_group = pure_metrics_groups["text"][
+                        token_truth=lambda _token_index: False,
+                        include_window_rows=should_save_window_rows(
+                            args.save_window_raw
+                        ),
+                        window_row_writer=window_writer,
+                        decision_modes=window_decision_modes,
+                        contextual_thresholds=window_contextual_thresholds,
+                        shared_foreign_thresholds=window_shared_foreign_thresholds,
+                        shared_foreign_min_window_count=args.window_shared_foreign_min_window_count,
+                        shared_foreign_min_ratio=args.window_shared_foreign_min_ratio,
+                    ):
+                        window_group = pure_window_groups[
+                            (
+                                window_token_row["model"],
+                                window_token_row["model_family"],
+                                window_token_row["true_lang"],
+                                window_token_row["window_size"],
+                                window_token_row["window_decision_rule"],
+                                window_token_row["window_foreign_threshold"],
+                                window_token_row["window_shared_foreign_threshold"],
+                            )
+                        ]
+                        window_group["total"] += 1
+                        window_group["foreign_predicted"] += int(
+                            window_token_row["is_foreign_predicted"]
+                        )
+                        update_stats(
+                            window_group["foreign_probability"],
+                            window_token_row["foreign_probability"],
+                        )
+                        update_stats(
+                            window_group["main_lang_probability"],
+                            window_token_row["main_lang_probability"],
+                        )
+                        window_token_writer.write(window_token_row)
+
+                if not only_window:
+                    for token_item in tokens:
+                        word_prediction = model.predict(token_item.normalized)
+                        is_foreign = is_foreign_detection(
+                            model, text_prediction.predicted_lang, word_prediction
+                        )
+                        word_row = prediction_record(
+                            word_prediction,
+                            {
+                                "sample_id": sample.sample_id,
+                                "row_index": sample.row_index,
+                                "flores_config": sample.flores_config,
+                                "true_lang": sample.lang,
+                                "input_level": "word",
+                                "token_index": token_item.raw_index,
+                                "token": token_item.raw,
+                                "normalized_token": token_item.normalized,
+                                "text_predicted_lang": text_prediction.predicted_lang,
+                                "is_foreign_predicted": is_foreign,
+                                "correct": is_prediction_correct(
+                                    model,
+                                    sample.lang,
+                                    word_prediction.predicted_lang,
+                                ),
+                                "is_supported_target": is_supported_target(
+                                    supported_langs, model.name, sample.lang
+                                ),
+                            },
+                        )
+                        word_group = pure_metrics_groups["word"][
                             (model.name, model.family, sample.lang)
                         ]
-                        text_group["total"] += 1
-                        text_group["correct"] += int(text_row["correct"])
-                        update_stats(text_group["confidence"], text_row["confidence"])
-                        if should_save_raw_row(text_row, args.save_raw_level):
-                            text_writer.write(text_row)
-
-                    if not args.skip_window:
-                        for window_token_row in build_window_rows_and_token_scores(
-                            sample=sample,
-                            tokens=tokens,
-                            model=model,
-                            main_lang=text_prediction.predicted_lang,
-                            window_sizes=window_sizes,
-                            thresholds=window_thresholds,
-                            top_k=args.window_top_k,
-                            base_extra={
-                                **base_extra,
-                                "input_level": "window",
-                            },
-                            token_truth=lambda _token_index: False,
-                            include_window_rows=should_save_window_rows(
-                                args.save_window_raw
-                            ),
-                            window_row_writer=window_writer,
-                            decision_modes=window_decision_modes,
-                            contextual_thresholds=window_contextual_thresholds,
-                            shared_foreign_thresholds=window_shared_foreign_thresholds,
-                            shared_foreign_min_window_count=args.window_shared_foreign_min_window_count,
-                            shared_foreign_min_ratio=args.window_shared_foreign_min_ratio,
-                        ):
-                            window_group = pure_window_groups[
-                                (
-                                    window_token_row["model"],
-                                    window_token_row["model_family"],
-                                    window_token_row["true_lang"],
-                                    window_token_row["window_size"],
-                                    window_token_row["window_decision_rule"],
-                                    window_token_row["window_foreign_threshold"],
-                                    window_token_row["window_shared_foreign_threshold"],
-                                )
-                            ]
-                            window_group["total"] += 1
-                            window_group["foreign_predicted"] += int(
-                                window_token_row["is_foreign_predicted"]
-                            )
-                            update_stats(
-                                window_group["foreign_probability"],
-                                window_token_row["foreign_probability"],
-                            )
-                            update_stats(
-                                window_group["main_lang_probability"],
-                                window_token_row["main_lang_probability"],
-                            )
-                            window_token_writer.write(window_token_row)
-
-                    if not only_window:
-                        for token_item in tokens:
-                            word_prediction = model.predict(token_item.normalized)
-                            is_foreign = is_foreign_detection(
-                                model, text_prediction.predicted_lang, word_prediction
-                            )
-                            word_row = prediction_record(
-                                word_prediction,
-                                {
-                                    "sample_id": sample.sample_id,
-                                    "row_index": sample.row_index,
-                                    "flores_config": sample.flores_config,
-                                    "true_lang": sample.lang,
-                                    "input_level": "word",
-                                    "token_index": token_item.raw_index,
-                                    "token": token_item.raw,
-                                    "normalized_token": token_item.normalized,
-                                    "text_predicted_lang": text_prediction.predicted_lang,
-                                    "is_foreign_predicted": is_foreign,
-                                    "correct": is_prediction_correct(
-                                        model,
-                                        sample.lang,
-                                        word_prediction.predicted_lang,
-                                    ),
-                                    "is_supported_target": is_supported_target(
-                                        supported_langs, model.name, sample.lang
-                                    ),
-                                },
-                            )
-                            word_group = pure_metrics_groups["word"][
-                                (model.name, model.family, sample.lang)
-                            ]
-                            word_group["total"] += 1
-                            word_group["correct"] += int(word_row["correct"])
-                            word_group["foreign_predicted"] += int(
-                                word_row["is_foreign_predicted"]
-                            )
-                            update_stats(
-                                word_group["confidence"], word_row["confidence"]
-                            )
-                            if should_save_raw_row(word_row, args.save_raw_level):
-                                word_writer.write(word_row)
+                        word_group["total"] += 1
+                        word_group["correct"] += int(word_row["correct"])
+                        word_group["foreign_predicted"] += int(
+                            word_row["is_foreign_predicted"]
+                        )
+                        update_stats(word_group["confidence"], word_row["confidence"])
+                        if should_save_raw_row(word_row, args.save_raw_level):
+                            word_writer.write(word_row)
     finally:
         text_writer.close()
         word_writer.close()
@@ -1593,291 +1460,7 @@ def run_pure_evaluation(args, models, token, supported_langs):
     ), finalize_pure_window_metrics(pure_window_groups)
 
 
-def nearest_token_by_relative_position(target_token, source_tokens, target_count):
-    if not source_tokens or target_count <= 1:
-        return source_tokens[0] if source_tokens else None
-    relative = target_token.raw_index / max(target_count - 1, 1)
-    source_index = round(relative * (len(source_tokens) - 1))
-    source_index = max(0, min(len(source_tokens) - 1, source_index))
-    return source_tokens[source_index]
-
-
-def raw_text_parts(text):
-    return [match.group(0) for match in WHITESPACE_TOKEN_RE.finditer(text)]
-
-
-def build_injected_sample(spanish_sample, foreign_sample, injection_lang, ratio, rng):
-    spanish_tokens = tokenize(spanish_sample.text)
-    foreign_tokens = tokenize(foreign_sample.text)
-    raw_parts = raw_text_parts(spanish_sample.text)
-    if not spanish_tokens or not foreign_tokens or not raw_parts:
-        return None
-
-    injection_count = max(1, round(len(spanish_tokens) * ratio))
-    candidate_tokens = spanish_tokens[:]
-    rng.shuffle(candidate_tokens)
-
-    replacements = []
-    used_indexes = set()
-    for spanish_token in candidate_tokens:
-        if len(replacements) >= injection_count:
-            break
-        if spanish_token.raw_index in used_indexes:
-            continue
-
-        foreign_token = nearest_token_by_relative_position(
-            spanish_token, foreign_tokens, len(raw_parts)
-        )
-        if foreign_token is None:
-            continue
-        if foreign_token.normalized.casefold() == spanish_token.normalized.casefold():
-            continue
-        if not is_eligible_word(foreign_token.normalized):
-            continue
-
-        replacement = (
-            spanish_token.leading + foreign_token.normalized + spanish_token.trailing
-        )
-        raw_parts[spanish_token.raw_index] = replacement
-        used_indexes.add(spanish_token.raw_index)
-        replacements.append(
-            {
-                "token_index": spanish_token.raw_index,
-                "original_token": spanish_token.raw,
-                "original_normalized": spanish_token.normalized,
-                "replacement_token": replacement,
-                "replacement_normalized": foreign_token.normalized,
-                "injected_lang": injection_lang,
-                "foreign_source_index": foreign_token.raw_index,
-            }
-        )
-
-    if not replacements:
-        return None
-
-    sample_id = f"{spanish_sample.sample_id}:inject:{injection_lang}"
-    return {
-        "sample_id": sample_id,
-        "source_sample_id": spanish_sample.sample_id,
-        "row_index": spanish_sample.row_index,
-        "source_config": spanish_sample.flores_config,
-        "base_lang": SPANISH,
-        "injected_lang": injection_lang,
-        "contamination_type": "position_token",
-        "injection_ratio": ratio,
-        "requested_injections": injection_count,
-        "actual_injections": len(replacements),
-        "text": " ".join(raw_parts),
-        "original_text": spanish_sample.text,
-        "foreign_text": foreign_sample.text,
-        "injections": replacements,
-    }
-
-
-def iter_injected_samples(args, token):
-    spanish_by_row = {
-        sample.row_index: sample
-        for sample in iter_flores_samples(
-            args.flores_dataset,
-            args.spanish_config,
-            args.split,
-            token,
-            args.limit_samples_per_language,
-        )
-    }
-    rng = random.Random(args.seed)
-
-    for config in parse_csv(args.injection_configs):
-        for foreign_sample in iter_flores_samples(
-            args.flores_dataset,
-            config,
-            args.split,
-            token,
-            args.limit_samples_per_language,
-        ):
-            injection_lang = config_to_lang(config)
-            spanish_sample = spanish_by_row.get(foreign_sample.row_index)
-            if spanish_sample is None:
-                continue
-            injected_sample = build_injected_sample(
-                spanish_sample,
-                foreign_sample,
-                injection_lang,
-                args.injection_ratio,
-                rng,
-            )
-            if injected_sample is not None:
-                injected_sample["split"] = args.split
-                yield injected_sample
-
-
-def choose_relative_span(source_start, source_count, target_count, span_length):
-    if target_count < span_length:
-        return None
-    if source_count <= 1:
-        target_start = 0
-    else:
-        relative = source_start / max(source_count - span_length, 1)
-        target_start = round(relative * max(target_count - span_length, 0))
-    target_start = max(0, min(target_count - span_length, target_start))
-    return target_start
-
-
-def contiguous_token_span(tokens, start, span_length):
-    span = tokens[start : start + span_length]
-    if len(span) != span_length:
-        return None
-    expected_indexes = list(range(span[0].raw_index, span[0].raw_index + span_length))
-    if [token.raw_index for token in span] != expected_indexes:
-        return None
-    return span
-
-
-def build_phrase_sample(spanish_sample, foreign_sample, injection_lang, args, rng):
-    spanish_tokens = tokenize(spanish_sample.text)
-    foreign_tokens = tokenize(foreign_sample.text)
-    raw_parts = raw_text_parts(spanish_sample.text)
-    if not spanish_tokens or not foreign_tokens or not raw_parts:
-        return None
-
-    target_replacements = max(
-        1, round(len(spanish_tokens) * args.phrase_replacement_ratio)
-    )
-    candidate_starts = list(range(len(spanish_tokens)))
-    rng.shuffle(candidate_starts)
-
-    replacements = []
-    used_indexes = set()
-    replaced_count = 0
-    for start in candidate_starts:
-        if replaced_count >= target_replacements:
-            break
-        span_lengths = list(range(args.phrase_span_min, args.phrase_span_max + 1))
-        rng.shuffle(span_lengths)
-
-        for span_length in span_lengths:
-            if replaced_count + span_length > target_replacements and replacements:
-                continue
-            spanish_span = contiguous_token_span(spanish_tokens, start, span_length)
-            if spanish_span is None:
-                continue
-            span_indexes = {token.raw_index for token in spanish_span}
-            if span_indexes & used_indexes:
-                continue
-
-            foreign_start = choose_relative_span(
-                start,
-                len(spanish_tokens),
-                len(foreign_tokens),
-                span_length,
-            )
-            if foreign_start is None:
-                continue
-            foreign_span = foreign_tokens[foreign_start : foreign_start + span_length]
-            if len(foreign_span) != span_length:
-                continue
-            if any(not is_eligible_word(token.normalized) for token in foreign_span):
-                continue
-
-            same_count = sum(
-                1
-                for spanish_token, foreign_token in zip(spanish_span, foreign_span)
-                if spanish_token.normalized.casefold()
-                == foreign_token.normalized.casefold()
-            )
-            if same_count == span_length:
-                continue
-
-            span_id = len(replacements)
-            for offset, (spanish_token, foreign_token) in enumerate(
-                zip(spanish_span, foreign_span)
-            ):
-                replacement = (
-                    spanish_token.leading
-                    + foreign_token.normalized
-                    + spanish_token.trailing
-                )
-                raw_parts[spanish_token.raw_index] = replacement
-                used_indexes.add(spanish_token.raw_index)
-                replacements.append(
-                    {
-                        "span_id": span_id,
-                        "span_offset": offset,
-                        "span_length": span_length,
-                        "token_index": spanish_token.raw_index,
-                        "original_token": spanish_token.raw,
-                        "original_normalized": spanish_token.normalized,
-                        "replacement_token": replacement,
-                        "replacement_normalized": foreign_token.normalized,
-                        "injected_lang": injection_lang,
-                        "foreign_source_index": foreign_token.raw_index,
-                    }
-                )
-            replaced_count += span_length
-            break
-
-    if not replacements:
-        return None
-
-    sample_id = f"{spanish_sample.sample_id}:phrase:{injection_lang}"
-    return {
-        "sample_id": sample_id,
-        "source_sample_id": spanish_sample.sample_id,
-        "row_index": spanish_sample.row_index,
-        "source_config": spanish_sample.flores_config,
-        "base_lang": SPANISH,
-        "injected_lang": injection_lang,
-        "contamination_type": "phrase_span",
-        "injection_ratio": args.phrase_replacement_ratio,
-        "phrase_span_min": args.phrase_span_min,
-        "phrase_span_max": args.phrase_span_max,
-        "requested_injections": target_replacements,
-        "actual_injections": len(replacements),
-        "text": " ".join(raw_parts),
-        "original_text": spanish_sample.text,
-        "foreign_text": foreign_sample.text,
-        "injections": replacements,
-    }
-
-
-def iter_phrase_samples(args, token):
-    spanish_by_row = {
-        sample.row_index: sample
-        for sample in iter_flores_samples(
-            args.flores_dataset,
-            args.spanish_config,
-            args.split,
-            token,
-            args.limit_samples_per_language,
-        )
-    }
-    rng = random.Random(args.seed)
-
-    for config in parse_csv(args.injection_configs):
-        for foreign_sample in iter_flores_samples(
-            args.flores_dataset,
-            config,
-            args.split,
-            token,
-            args.limit_samples_per_language,
-        ):
-            injection_lang = config_to_lang(config)
-            spanish_sample = spanish_by_row.get(foreign_sample.row_index)
-            if spanish_sample is None:
-                continue
-            phrase_sample = build_phrase_sample(
-                spanish_sample,
-                foreign_sample,
-                injection_lang,
-                args,
-                rng,
-            )
-            if phrase_sample is not None:
-                phrase_sample["split"] = args.split
-                yield phrase_sample
-
-
-def run_mixed_evaluation(args, models, sample_filename, output_prefix, evaluation_name):
+def run_mixed_evaluation(args, models, samples, output_prefix, evaluation_name):
     output_dir = Path(args.output_dir)
     only_window = args.only_window
     word_groups = defaultdict(
@@ -1917,7 +1500,7 @@ def run_mixed_evaluation(args, models, sample_filename, output_prefix, evaluatio
     )
     word_writer = JsonlStreamWriter(
         output_dir / f"{output_prefix}_word_predictions.jsonl",
-        enabled=not only_window,
+        enabled=not only_window and should_save_prediction_rows(args.save_raw_level),
         transform=slim_prediction_row,
     )
     window_writer = JsonlStreamWriter(
@@ -1931,166 +1514,133 @@ def run_mixed_evaluation(args, models, sample_filename, output_prefix, evaluatio
         and should_save_window_token_rows(args.save_window_raw),
         transform=lambda row: slim_window_token_row(row, args.save_raw_level),
     )
-    source_dataset = None
-    source_config = None
-    source_split = None
-    source_text_cache = {}
-
     try:
-        with (output_dir / sample_filename).open("r", encoding="utf-8") as f:
-            for line in f:
-                sample = json.loads(line)
-                sample_text = sample.get("text")
-                if sample_text is None:
-                    sample_source_config = sample["source_config"]
-                    sample_source_split = sample.get("split", args.split)
-                    if source_dataset is None:
-                        source_config = sample_source_config
-                        source_split = sample_source_split
-                        log(f"Loading FLORES {source_config}/{source_split}")
-                        source_dataset = load_dataset(
-                            args.flores_dataset,
-                            source_config,
-                            split=source_split,
-                            **dataset_kwargs(os.getenv(args.hf_token_env)),
-                        )
-                    elif (
-                        sample_source_config != source_config
-                        or sample_source_split != source_split
-                    ):
-                        raise ValueError(
-                            "Mixed sample reconstruction requires a single source_config and split per run."
-                        )
-                    source_text = source_text_cache.get(sample["row_index"])
-                    if source_text is None:
-                        source_text = text_from_row(source_dataset[sample["row_index"]])
-                        source_text_cache[sample["row_index"]] = source_text
-                    sample_text = reconstruct_mixed_text(sample, source_text)
-
-                injected_indexes = {
-                    injection["token_index"]: injection
-                    for injection in sample["injections"]
+        for sample in samples:
+            sample_text = sample["text"]
+            injected_indexes = {
+                injection["token_index"]: injection
+                for injection in sample["injections"]
+            }
+            tokens = tokenize(sample_text)
+            for model in models:
+                text_prediction = model.predict(sample_text)
+                base_extra = {
+                    "sample_id": sample["sample_id"],
+                    "source_sample_id": sample["source_sample_id"],
+                    "row_index": sample["row_index"],
+                    "base_lang": SPANISH,
+                    "injected_lang": sample["injected_lang"],
+                    "contamination_type": sample.get(
+                        "contamination_type", output_prefix
+                    ),
+                    "text_predicted_lang": text_prediction.predicted_lang,
+                    "text_predicted_label": text_prediction.predicted_label,
+                    "text_confidence": text_prediction.confidence,
                 }
-                tokens = tokenize(sample_text)
-                for model in models:
-                    text_prediction = model.predict(sample_text)
-                    base_extra = {
-                        "sample_id": sample["sample_id"],
-                        "source_sample_id": sample["source_sample_id"],
-                        "row_index": sample["row_index"],
-                        "base_lang": SPANISH,
-                        "injected_lang": sample["injected_lang"],
-                        "contamination_type": sample.get(
-                            "contamination_type", output_prefix
+                if not args.skip_window:
+                    for window_token_row in build_window_rows_and_token_scores(
+                        sample=sample,
+                        tokens=tokens,
+                        model=model,
+                        main_lang=SPANISH,
+                        window_sizes=window_sizes,
+                        thresholds=window_thresholds,
+                        top_k=args.window_top_k,
+                        base_extra={
+                            **base_extra,
+                            "input_level": "window",
+                        },
+                        token_truth=lambda token_index, indexes=injected_indexes: (
+                            token_index in indexes
                         ),
-                        "text_predicted_lang": text_prediction.predicted_lang,
-                        "text_predicted_label": text_prediction.predicted_label,
-                        "text_confidence": text_prediction.confidence,
-                    }
-                    if not args.skip_window:
-                        for window_token_row in build_window_rows_and_token_scores(
-                            sample=sample,
-                            tokens=tokens,
-                            model=model,
-                            main_lang=SPANISH,
-                            window_sizes=window_sizes,
-                            thresholds=window_thresholds,
-                            top_k=args.window_top_k,
-                            base_extra={
-                                **base_extra,
-                                "input_level": "window",
-                            },
-                            token_truth=lambda token_index, indexes=injected_indexes: (
-                                token_index in indexes
-                            ),
-                            token_injections=injected_indexes,
-                            include_window_rows=should_save_window_rows(
-                                args.save_window_raw
-                            ),
-                            window_row_writer=window_writer,
-                            decision_modes=window_decision_modes,
-                            contextual_thresholds=window_contextual_thresholds,
-                            shared_foreign_thresholds=window_shared_foreign_thresholds,
-                            shared_foreign_min_window_count=args.window_shared_foreign_min_window_count,
-                            shared_foreign_min_ratio=args.window_shared_foreign_min_ratio,
-                        ):
-                            window_group = window_groups[
-                                (
-                                    window_token_row["model"],
-                                    window_token_row["model_family"],
-                                    window_token_row["injected_lang"],
-                                    window_token_row["window_size"],
-                                    window_token_row["window_decision_rule"],
-                                    window_token_row["window_foreign_threshold"],
-                                    window_token_row["window_shared_foreign_threshold"],
-                                )
-                            ]
-                            outcome = update_outcome_counts(
-                                window_group,
-                                window_token_row["is_foreign_ground_truth"],
-                                window_token_row["is_foreign_predicted"],
+                        token_injections=injected_indexes,
+                        include_window_rows=should_save_window_rows(
+                            args.save_window_raw
+                        ),
+                        window_row_writer=window_writer,
+                        decision_modes=window_decision_modes,
+                        contextual_thresholds=window_contextual_thresholds,
+                        shared_foreign_thresholds=window_shared_foreign_thresholds,
+                        shared_foreign_min_window_count=args.window_shared_foreign_min_window_count,
+                        shared_foreign_min_ratio=args.window_shared_foreign_min_ratio,
+                    ):
+                        window_group = window_groups[
+                            (
+                                window_token_row["model"],
+                                window_token_row["model_family"],
+                                window_token_row["injected_lang"],
+                                window_token_row["window_size"],
+                                window_token_row["window_decision_rule"],
+                                window_token_row["window_foreign_threshold"],
+                                window_token_row["window_shared_foreign_threshold"],
                             )
-                            update_stats(
-                                window_group[f"{outcome}_foreign_probability"],
-                                window_token_row["foreign_probability"],
-                            )
-                            update_stats(
-                                window_group["main_lang_probability"],
-                                window_token_row["main_lang_probability"],
-                            )
-                            window_token_writer.write(window_token_row)
+                        ]
+                        outcome = update_outcome_counts(
+                            window_group,
+                            window_token_row["is_foreign_ground_truth"],
+                            window_token_row["is_foreign_predicted"],
+                        )
+                        update_stats(
+                            window_group[f"{outcome}_foreign_probability"],
+                            window_token_row["foreign_probability"],
+                        )
+                        update_stats(
+                            window_group["main_lang_probability"],
+                            window_token_row["main_lang_probability"],
+                        )
+                        window_token_writer.write(window_token_row)
 
-                    if not only_window:
-                        for token_item in tokens:
-                            word_prediction = model.predict(token_item.normalized)
-                            truth = token_item.raw_index in injected_indexes
-                            predicted = is_foreign_detection(
-                                model, SPANISH, word_prediction
+                if not only_window:
+                    for token_item in tokens:
+                        word_prediction = model.predict(token_item.normalized)
+                        truth = token_item.raw_index in injected_indexes
+                        predicted = is_foreign_detection(
+                            model, SPANISH, word_prediction
+                        )
+                        injection = injected_indexes.get(token_item.raw_index, {})
+                        row = prediction_record(
+                            word_prediction,
+                            {
+                                **base_extra,
+                                "input_level": "word",
+                                "token_index": token_item.raw_index,
+                                "token": token_item.raw,
+                                "normalized_token": token_item.normalized,
+                                "is_foreign_ground_truth": truth,
+                                "is_foreign_predicted": predicted,
+                                "original_normalized": injection.get(
+                                    "original_normalized"
+                                ),
+                                "replacement_normalized": injection.get(
+                                    "replacement_normalized"
+                                ),
+                                "span_id": injection.get("span_id"),
+                                "span_offset": injection.get("span_offset"),
+                                "span_length": injection.get("span_length"),
+                                "correct": truth == predicted,
+                            },
+                        )
+                        word_group = word_groups[
+                            (
+                                row["model"],
+                                row["model_family"],
+                                row["injected_lang"],
                             )
-                            injection = injected_indexes.get(token_item.raw_index, {})
-                            row = prediction_record(
-                                word_prediction,
-                                {
-                                    **base_extra,
-                                    "input_level": "word",
-                                    "token_index": token_item.raw_index,
-                                    "token": token_item.raw,
-                                    "normalized_token": token_item.normalized,
-                                    "is_foreign_ground_truth": truth,
-                                    "is_foreign_predicted": predicted,
-                                    "original_normalized": injection.get(
-                                        "original_normalized"
-                                    ),
-                                    "replacement_normalized": injection.get(
-                                        "replacement_normalized"
-                                    ),
-                                    "span_id": injection.get("span_id"),
-                                    "span_offset": injection.get("span_offset"),
-                                    "span_length": injection.get("span_length"),
-                                    "correct": truth == predicted,
-                                },
-                            )
-                            word_group = word_groups[
-                                (
-                                    row["model"],
-                                    row["model_family"],
-                                    row["injected_lang"],
-                                )
-                            ]
-                            outcome = update_outcome_counts(
-                                word_group,
-                                row["is_foreign_ground_truth"],
-                                row["is_foreign_predicted"],
-                            )
-                            update_stats(
-                                word_group[f"{outcome}_confidence"],
-                                row["confidence"],
-                            )
-                            update_stats(
-                                word_group["text_confidence"], row["text_confidence"]
-                            )
-                            if should_save_raw_row(row, args.save_raw_level):
-                                word_writer.write(row)
+                        ]
+                        outcome = update_outcome_counts(
+                            word_group,
+                            row["is_foreign_ground_truth"],
+                            row["is_foreign_predicted"],
+                        )
+                        update_stats(
+                            word_group[f"{outcome}_confidence"],
+                            row["confidence"],
+                        )
+                        update_stats(
+                            word_group["text_confidence"], row["text_confidence"]
+                        )
+                        if should_save_raw_row(row, args.save_raw_level):
+                            word_writer.write(row)
     finally:
         word_writer.close()
         window_writer.close()
@@ -2103,21 +1653,21 @@ def run_mixed_evaluation(args, models, sample_filename, output_prefix, evaluatio
     )
 
 
-def run_injected_evaluation(args, models):
+def run_injected_evaluation(args, models, injected_samples):
     return run_mixed_evaluation(
         args,
         models,
-        "injected_samples.jsonl",
+        injected_samples,
         "injected",
         "injected_word_detection",
     )
 
 
-def run_phrase_evaluation(args, models):
+def run_phrase_evaluation(args, models, phrase_samples):
     return run_mixed_evaluation(
         args,
         models,
-        "phrase_samples.jsonl",
+        phrase_samples,
         "phrase",
         "phrase_word_detection",
     )
@@ -2155,28 +1705,46 @@ def write_metrics(
     summary = {}
     if pure_metrics:
         write_csv(output_dir / "pure_foreign_detection_metrics.csv", pure_metrics)
-        summary["pure"] = pure_metrics
+        summary["pure"] = {
+            "path": "pure_foreign_detection_metrics.csv",
+            "rows": len(pure_metrics),
+        }
     if injected_metrics:
         write_csv(output_dir / "injected_detection_metrics.csv", injected_metrics)
-        summary["injected"] = injected_metrics
+        summary["injected"] = {
+            "path": "injected_detection_metrics.csv",
+            "rows": len(injected_metrics),
+        }
     if phrase_metrics:
         write_csv(output_dir / "phrase_detection_metrics.csv", phrase_metrics)
-        summary["phrase"] = phrase_metrics
+        summary["phrase"] = {
+            "path": "phrase_detection_metrics.csv",
+            "rows": len(phrase_metrics),
+        }
     if pure_window_metrics:
         write_csv(output_dir / "pure_window_detection_metrics.csv", pure_window_metrics)
-        summary["pure_window"] = pure_window_metrics
+        summary["pure_window"] = {
+            "path": "pure_window_detection_metrics.csv",
+            "rows": len(pure_window_metrics),
+        }
     if injected_window_metrics:
         write_csv(
             output_dir / "injected_window_detection_metrics.csv",
             injected_window_metrics,
         )
-        summary["injected_window"] = injected_window_metrics
+        summary["injected_window"] = {
+            "path": "injected_window_detection_metrics.csv",
+            "rows": len(injected_window_metrics),
+        }
     if phrase_window_metrics:
         write_csv(
             output_dir / "phrase_window_detection_metrics.csv",
             phrase_window_metrics,
         )
-        summary["phrase_window"] = phrase_window_metrics
+        summary["phrase_window"] = {
+            "path": "phrase_window_detection_metrics.csv",
+            "rows": len(phrase_window_metrics),
+        }
 
     write_json(output_dir / "metrics_summary.json", summary)
 
@@ -2201,7 +1769,13 @@ def is_supported_target(supported_langs, model_name, lang):
     return lang in supported
 
 
-def write_run_metadata(args, models, output_dir, pure_configs):
+def write_run_metadata(
+    args,
+    models,
+    output_dir,
+    prepared_profile_dir,
+    prepared_summary,
+):
     metadata = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "args": vars(args),
@@ -2218,19 +1792,27 @@ def write_run_metadata(args, models, output_dir, pure_configs):
             args.window_shared_foreign_threshold
         ),
         "models": [{"name": model.name, "family": model.family} for model in models],
-        "pure_configs": pure_configs,
-        "language_mappings": ISO_639_3_TO_1,
+        "prepared_data": prepared_summary,
+        "prepared_data_dir": str(prepared_profile_dir),
     }
     write_json(output_dir / "run_metadata.json", metadata)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate language ID models for FLORES foreign-word detection."
+        description=(
+            "Evaluate language ID models using a prepared dataset profile created "
+            "by src/prepare_data.py."
+        )
     )
     parser.add_argument(
         "--output-dir",
-        default="evaluation_results/flores_foreign_words_run_contextual_values",
+        default="evaluation_results/flores_foreign_words_run_1",
+    )
+    parser.add_argument(
+        "--prepared-data-dir",
+        required=True,
+        help="Prepared dataset profile directory containing manifest and sample JSONLs.",
     )
     parser.add_argument("--binary-model-root", default="models/spanish_binary_runs")
     parser.add_argument(
@@ -2241,22 +1823,6 @@ def parse_args():
             "Spanish binary model plus FastText, GlotLID, and Lingua."
         ),
     )
-    parser.add_argument("--flores-dataset", default=DEFAULT_FLORES_DATASET)
-    parser.add_argument("--split", default=DEFAULT_SPLIT)
-    parser.add_argument(
-        "--flores-configs",
-        default=None,
-        help=(
-            "Comma-separated FLORES configs for pure-language evaluation. "
-            "Defaults to Spanish plus the injection target languages."
-        ),
-    )
-    parser.add_argument("--limit-languages", default=None)
-    parser.add_argument("--limit-samples-per-language", type=int, default=None)
-    parser.add_argument("--spanish-config", default=DEFAULT_SPANISH_CONFIG)
-    parser.add_argument("--injection-configs", default=DEFAULT_INJECTION_CONFIGS)
-    parser.add_argument("--injection-ratio", type=float, default=0.22)
-    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--skip-pure", action="store_true")
     parser.add_argument("--skip-injected", action="store_true")
     parser.add_argument("--skip-phrase-swaps", action="store_true")
@@ -2271,29 +1837,22 @@ def parse_args():
     )
     parser.add_argument(
         "--save-raw-level",
-        choices=("errors_only", "token_full", "all_raw"),
-        default="errors_only",
+        choices=("none", "errors_only", "token_full", "all_raw"),
+        default="none",
         help=(
             "How much raw prediction data to persist. "
+            "'none' writes no text/word prediction JSONL files, "
             "'errors_only' keeps only misclassified non-window rows, "
             "'token_full' keeps all text/word rows, and 'all_raw' keeps everything."
         ),
     )
     parser.add_argument(
-        "--save-sample-text",
-        choices=("none", "mixed_only", "all_text"),
-        default="none",
-        help=(
-            "How much mixed-sample text to persist in injected/phrase sample files. "
-            "'none' stores reconstruction metadata only."
-        ),
-    )
-    parser.add_argument(
         "--save-window-raw",
         choices=("none", "token_scores", "all"),
-        default="token_scores",
+        default="none",
         help=(
             "How much window-level raw output to persist. "
+            "'none' writes no window raw JSONL files. "
             "'token_scores' keeps only aggregated per-token window scores."
         ),
     )
@@ -2342,24 +1901,6 @@ def parse_args():
         default=10,
         help="Number of labels to request for window scoring.",
     )
-    parser.add_argument(
-        "--phrase-replacement-ratio",
-        type=float,
-        default=0.22,
-        help="Approximate share of eligible Spanish tokens to replace with phrase spans.",
-    )
-    parser.add_argument(
-        "--phrase-span-min",
-        type=int,
-        default=2,
-        help="Minimum phrase span length for phrase swaps.",
-    )
-    parser.add_argument(
-        "--phrase-span-max",
-        type=int,
-        default=4,
-        help="Maximum phrase span length for phrase swaps.",
-    )
     parser.add_argument("--env-file", default=".env")
     parser.add_argument("--hf-token-env", default="HUGGING_FACE_TOKEN")
     parser.add_argument(
@@ -2373,14 +1914,6 @@ def parse_args():
 
 
 def validate_args(args):
-    if args.injection_ratio <= 0.0 or args.injection_ratio > 1.0:
-        raise ValueError("--injection-ratio must be in the range (0, 1].")
-    if args.phrase_replacement_ratio <= 0.0 or args.phrase_replacement_ratio > 1.0:
-        raise ValueError("--phrase-replacement-ratio must be in the range (0, 1].")
-    if args.phrase_span_min < 1:
-        raise ValueError("--phrase-span-min must be at least 1.")
-    if args.phrase_span_max < args.phrase_span_min:
-        raise ValueError("--phrase-span-max must be >= --phrase-span-min.")
     parse_window_decision_modes(args.window_decision_modes)
     parse_window_foreign_thresholds(args.window_foreign_threshold)
     parse_window_contextual_thresholds(args.window_contextual_threshold)
@@ -2401,11 +1934,6 @@ def validate_args(args):
         raise ValueError("--window-sizes must include at least one integer.")
     if any(window_size < 2 for window_size in window_sizes):
         raise ValueError("--window-sizes values must be at least 2.")
-    if (
-        args.limit_samples_per_language is not None
-        and args.limit_samples_per_language < 1
-    ):
-        raise ValueError("--limit-samples-per-language must be at least 1.")
     if args.only_window and args.skip_window:
         raise ValueError("--only-window cannot be combined with --skip-window.")
     if args.skip_pure and args.skip_injected and args.skip_phrase_swaps:
@@ -2427,8 +1955,21 @@ def main():
     else:
         log(f"No Hugging Face token found in ${args.hf_token_env}.")
 
-    models = load_models(args)
+    prepared_manifest, prepared_profile_dir, prepared_datasets = (
+        load_prepared_datasets_from_dir(
+            args.prepared_data_dir,
+            include_pure=not args.skip_pure,
+            include_injected=not args.skip_injected,
+            include_phrase=not args.skip_phrase_swaps,
+        )
+    )
+    prepared_summary = prepared_manifest_summary(prepared_manifest)
+
+    models = load_models(args, prepared_manifest)
     supported_langs = build_supported_lang_map(models)
+    pure_samples = prepared_datasets.get("pure", [])
+    injected_samples = prepared_datasets.get("injected", [])
+    phrase_samples = prepared_datasets.get("phrase", [])
 
     pure_metrics = []
     pure_window_metrics = []
@@ -2436,43 +1977,31 @@ def main():
     injected_window_metrics = []
     phrase_metrics = []
     phrase_window_metrics = []
-    pure_configs = []
+    write_run_metadata(
+        args,
+        models,
+        output_dir,
+        prepared_profile_dir,
+        prepared_summary,
+    )
 
     if not args.skip_pure:
-        pure_configs = resolve_pure_configs(args, token)
-        write_run_metadata(args, models, output_dir, pure_configs)
         (
             pure_metrics,
             pure_window_metrics,
-        ) = run_pure_evaluation(args, models, token, supported_langs)
-    else:
-        write_run_metadata(args, models, output_dir, pure_configs)
+        ) = run_pure_evaluation(args, models, pure_samples, supported_langs)
 
     if not args.skip_injected:
-        write_jsonl(
-            output_dir / "injected_samples.jsonl",
-            (
-                serialize_mixed_sample(sample, args.save_sample_text)
-                for sample in iter_injected_samples(args, token)
-            ),
-        )
         (
             injected_metrics,
             injected_window_metrics,
-        ) = run_injected_evaluation(args, models)
+        ) = run_injected_evaluation(args, models, injected_samples)
 
     if not args.skip_phrase_swaps:
-        write_jsonl(
-            output_dir / "phrase_samples.jsonl",
-            (
-                serialize_mixed_sample(sample, args.save_sample_text)
-                for sample in iter_phrase_samples(args, token)
-            ),
-        )
         (
             phrase_metrics,
             phrase_window_metrics,
-        ) = run_phrase_evaluation(args, models)
+        ) = run_phrase_evaluation(args, models, phrase_samples)
 
     write_metrics(
         output_dir,
