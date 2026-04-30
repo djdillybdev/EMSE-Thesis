@@ -31,47 +31,15 @@ from prepare_data import (
 )
 
 
-PROMPT = """You are a multilingual token-level language identification engine.
+PROMPT = """Find foreign-word tokens inside Spanish text.
 
 Analyze only the text between <INPUT> and </INPUT>.
+Assume the sentence is Spanish-context text.
 
-Return only valid JSON. No Markdown. No explanations. No extra text.
-
-Your job:
-1. Identify the main language of the full input sentence.
-2. Split the input into tokens.
-3. Assign a language or label to each token.
-4. Mark tokens as foreign when their language differs from the main language.
-5. Return a list of foreign tokens.
-
-Token rules:
-- Preserve each token exactly as written.
-- Include punctuation as separate tokens.
-- Label punctuation as "punctuation".
-- Label numbers as "number".
-- Label names as "proper_noun" when they are names rather than foreign words.
-- Label acronyms as "acronym" unless the language is clear.
-- Use "unknown" if uncertain.
-- Use ISO 639-1 codes for natural languages.
-
-Foreign word rules:
-- A token is foreign if it is a natural-language word whose language differs from the main language.
-- Do not mark punctuation, numbers, acronyms, or proper nouns as foreign.
-- Borrowed words that are commonly used in the main language may still be marked as foreign if they clearly retain their source-language form.
-- If unsure whether a word is foreign or borrowed, set "is_foreign": false and use a lower confidence.
-
-Return exactly this JSON structure:
+Return JSON only with this structure:
 
 {
-  "main_language": "",
-  "tokens": [
-    {
-      "token": "",
-      "language": "",
-      "is_foreign": false,
-      "confidence": 0.0
-    }
-  ],
+  "main_language": "es",
   "foreign_tokens": [
     {
       "token": "",
@@ -81,16 +49,46 @@ Return exactly this JSON structure:
   ]
 }
 
+Rules:
+- Always set "main_language" to "es".
+- Include only natural-language words that are not Spanish in "foreign_tokens".
+- Do not include punctuation, numbers, acronyms, or proper nouns.
+- Preserve each returned token exactly as written in the input.
+- Use ISO 639-1 codes when the foreign language is clear, otherwise use "unknown".
+- If no foreign words are present, return an empty "foreign_tokens" array.
+
 <INPUT>
 {{sentence}}
 </INPUT>"""
 
 
 MODEL_FAMILY = "ollama_llm"
-DEFAULT_MODELS = "llama3.2:latest,ministral-3:8b,qwen3.5:9b"
+# DEFAULT_MODELS = "llama3.2:latest,ministral-3:8b,qwen3.5:9b"
+DEFAULT_MODELS = "ministral-3:8b"
 SPANISH = "es"
 ISO_LANG_RE = re.compile(r"^[a-z]{2}$")
 SPECIAL_TOKEN_LABELS = {"punctuation", "number", "proper_noun", "acronym", "unknown"}
+RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "main_language": {"type": "string", "const": "es"},
+        "foreign_tokens": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "token": {"type": "string"},
+                    "language": {"type": "string"},
+                    "confidence": {"type": "number"},
+                },
+                "required": ["token", "language", "confidence"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["main_language", "foreign_tokens"],
+    "additionalProperties": False,
+}
 
 
 @dataclass(frozen=True)
@@ -101,6 +99,14 @@ class LLMResult:
     parse_error: Optional[str]
     latency_ms: float
     retry_count: int
+    transport_retry_count: int
+    json_retry_count: int
+    total_duration_ms: float
+    load_duration_ms: float
+    prompt_eval_count: int
+    prompt_eval_duration_ms: float
+    eval_count: int
+    eval_duration_ms: float
 
 
 @dataclass(frozen=True)
@@ -135,6 +141,12 @@ class AggregatePrediction:
     latency_ms: float
     retry_count: int
     call_count: int
+    total_duration_ms: float
+    load_duration_ms: float
+    prompt_eval_count: int
+    prompt_eval_duration_ms: float
+    eval_count: int
+    eval_duration_ms: float
 
 
 def parse_args():
@@ -146,7 +158,7 @@ def parse_args():
     )
     parser.add_argument(
         "--output-dir",
-        default="evaluation_results/flores_llm_run",
+        default="evaluation_results/flores_llm_run_ministral",
     )
     parser.add_argument(
         "--prepared-data-dir",
@@ -169,9 +181,43 @@ def parse_args():
     parser.add_argument("--ollama-url", default="http://localhost:11434")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--timeout", type=int, default=45)
-    parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=0,
+        help="Transport retries per sample.",
+    )
+    parser.add_argument(
+        "--json-retries",
+        type=int,
+        default=1,
+        help="Retries for invalid JSON responses.",
+    )
     parser.add_argument("--retry-backoff-seconds", type=float, default=1.0)
     parser.add_argument("--max-consecutive-transport-failures", type=int, default=12)
+    parser.add_argument(
+        "--keep-alive",
+        default="10m",
+        help="Ollama keep_alive value to keep the model loaded between requests.",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=0,
+        help="Limit each selected dataset to the first N samples. Use 0 for all.",
+    )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=50,
+        help="Report dataset progress every N samples. Use 0 to disable periodic logs.",
+    )
+    parser.add_argument(
+        "--progress-min-seconds",
+        type=float,
+        default=30.0,
+        help="Minimum seconds between periodic progress logs.",
+    )
     return parser.parse_args()
 
 
@@ -184,12 +230,21 @@ def prompt_for_text(text):
     return PROMPT.replace("{{sentence}}", text)
 
 
-def call_ollama(model, prompt, ollama_url, temperature, timeout):
+def duration_ms_from_ns(value):
+    try:
+        return float(value) / 1_000_000.0
+    except Exception:
+        return 0.0
+
+
+def call_ollama(model, prompt, ollama_url, temperature, timeout, keep_alive):
     url = f"{ollama_url.rstrip('/')}/api/chat"
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
+        "format": RESPONSE_SCHEMA,
+        "keep_alive": keep_alive,
         "options": {"temperature": temperature},
     }
 
@@ -203,7 +258,20 @@ def call_ollama(model, prompt, ollama_url, temperature, timeout):
     response = urlopen(request, timeout=timeout)
     latency_ms = (time.perf_counter() - start) * 1000.0
     data = json.loads(response.read().decode("utf-8"))
-    return data.get("message", {}).get("content", ""), latency_ms
+    return (
+        data.get("message", {}).get("content", ""),
+        latency_ms,
+        {
+            "total_duration_ms": duration_ms_from_ns(data.get("total_duration")),
+            "load_duration_ms": duration_ms_from_ns(data.get("load_duration")),
+            "prompt_eval_count": int(data.get("prompt_eval_count") or 0),
+            "prompt_eval_duration_ms": duration_ms_from_ns(
+                data.get("prompt_eval_duration")
+            ),
+            "eval_count": int(data.get("eval_count") or 0),
+            "eval_duration_ms": duration_ms_from_ns(data.get("eval_duration")),
+        },
+    )
 
 
 def call_with_retry(
@@ -214,22 +282,34 @@ def call_with_retry(
     temperature,
     timeout,
     retries,
+    json_retries,
     retry_backoff_seconds,
+    keep_alive,
 ):
     total_latency = 0.0
     last_error = None
     last_raw = ""
-    retry_prompt = prompt
+    usage = {
+        "total_duration_ms": 0.0,
+        "load_duration_ms": 0.0,
+        "prompt_eval_count": 0,
+        "prompt_eval_duration_ms": 0.0,
+        "eval_count": 0,
+        "eval_duration_ms": 0.0,
+    }
+    transport_retry_count = 0
+    json_retry_count = 0
 
     for attempt in range(retries + 1):
         attempt_started_at = time.perf_counter()
         try:
-            raw_text, latency = call_ollama(
+            raw_text, latency, usage = call_ollama(
                 model=model,
-                prompt=retry_prompt,
+                prompt=prompt,
                 ollama_url=ollama_url,
                 temperature=temperature,
                 timeout=timeout,
+                keep_alive=keep_alive,
             )
             total_latency += latency
             last_raw = raw_text
@@ -237,6 +317,7 @@ def call_with_retry(
             total_latency += (time.perf_counter() - attempt_started_at) * 1000.0
             last_error = f"transport_error:{type(exc).__name__}: {exc}"
             if attempt < retries:
+                transport_retry_count += 1
                 sleep_seconds = max(0.0, retry_backoff_seconds) * (2**attempt)
                 if sleep_seconds > 0:
                     time.sleep(sleep_seconds)
@@ -247,29 +328,78 @@ def call_with_retry(
                 valid_json=False,
                 parse_error=last_error,
                 latency_ms=total_latency,
-                retry_count=attempt,
+                retry_count=transport_retry_count,
+                transport_retry_count=transport_retry_count,
+                json_retry_count=json_retry_count,
+                total_duration_ms=usage["total_duration_ms"],
+                load_duration_ms=usage["load_duration_ms"],
+                prompt_eval_count=usage["prompt_eval_count"],
+                prompt_eval_duration_ms=usage["prompt_eval_duration_ms"],
+                eval_count=usage["eval_count"],
+                eval_duration_ms=usage["eval_duration_ms"],
             )
 
-        try:
-            parsed = json.loads(raw_text)
-            if not isinstance(parsed, dict):
-                raise ValueError("Top-level JSON value must be an object.")
-            return LLMResult(
-                parsed=parsed,
-                raw_text=raw_text,
-                valid_json=True,
-                parse_error=None,
-                latency_ms=total_latency,
-                retry_count=attempt,
-            )
-        except Exception as exc:
-            last_error = str(exc)
-            if attempt < retries:
-                retry_prompt = (
-                    "Your previous output was invalid JSON.\n"
-                    "Return ONLY valid JSON matching the requested schema.\n"
-                    f"Original output:\n{raw_text}"
+        for json_attempt in range(json_retries + 1):
+            try:
+                parsed = json.loads(raw_text)
+                if not isinstance(parsed, dict):
+                    raise ValueError("Top-level JSON value must be an object.")
+                return LLMResult(
+                    parsed=parsed,
+                    raw_text=raw_text,
+                    valid_json=True,
+                    parse_error=None,
+                    latency_ms=total_latency,
+                    retry_count=transport_retry_count + json_retry_count,
+                    transport_retry_count=transport_retry_count,
+                    json_retry_count=json_retry_count,
+                    total_duration_ms=usage["total_duration_ms"],
+                    load_duration_ms=usage["load_duration_ms"],
+                    prompt_eval_count=usage["prompt_eval_count"],
+                    prompt_eval_duration_ms=usage["prompt_eval_duration_ms"],
+                    eval_count=usage["eval_count"],
+                    eval_duration_ms=usage["eval_duration_ms"],
                 )
+            except Exception as exc:
+                last_error = str(exc)
+                if json_attempt >= json_retries:
+                    break
+                json_retry_count += 1
+                json_retry_started_at = time.perf_counter()
+                try:
+                    raw_text, latency, usage = call_ollama(
+                        model=model,
+                        prompt=prompt,
+                        ollama_url=ollama_url,
+                        temperature=temperature,
+                        timeout=timeout,
+                        keep_alive=keep_alive,
+                    )
+                    total_latency += latency
+                    last_raw = raw_text
+                except (HTTPError, URLError, TimeoutError, OSError) as retry_exc:
+                    total_latency += (
+                        time.perf_counter() - json_retry_started_at
+                    ) * 1000.0
+                    last_error = (
+                        f"transport_error:{type(retry_exc).__name__}: {retry_exc}"
+                    )
+                    return LLMResult(
+                        parsed=None,
+                        raw_text=last_raw,
+                        valid_json=False,
+                        parse_error=last_error,
+                        latency_ms=total_latency,
+                        retry_count=transport_retry_count + json_retry_count,
+                        transport_retry_count=transport_retry_count,
+                        json_retry_count=json_retry_count,
+                        total_duration_ms=usage["total_duration_ms"],
+                        load_duration_ms=usage["load_duration_ms"],
+                        prompt_eval_count=usage["prompt_eval_count"],
+                        prompt_eval_duration_ms=usage["prompt_eval_duration_ms"],
+                        eval_count=usage["eval_count"],
+                        eval_duration_ms=usage["eval_duration_ms"],
+                    )
 
     return LLMResult(
         parsed=None,
@@ -277,7 +407,15 @@ def call_with_retry(
         valid_json=False,
         parse_error=last_error,
         latency_ms=total_latency,
-        retry_count=retries,
+        retry_count=transport_retry_count + json_retry_count,
+        transport_retry_count=transport_retry_count,
+        json_retry_count=json_retry_count,
+        total_duration_ms=usage["total_duration_ms"],
+        load_duration_ms=usage["load_duration_ms"],
+        prompt_eval_count=usage["prompt_eval_count"],
+        prompt_eval_duration_ms=usage["prompt_eval_duration_ms"],
+        eval_count=usage["eval_count"],
+        eval_duration_ms=usage["eval_duration_ms"],
     )
 
 
@@ -312,25 +450,9 @@ def safe_confidence(value):
 def normalize_response(parsed):
     if not isinstance(parsed, dict):
         return NormalizedResponse(
-            main_language="unknown",
+            main_language=SPANISH,
             tokens=(),
             foreign_tokens=(),
-        )
-
-    normalized_tokens = []
-    for item in parsed.get("tokens", []):
-        if not isinstance(item, dict):
-            continue
-        token = item.get("token")
-        if not isinstance(token, str):
-            continue
-        normalized_tokens.append(
-            NormalizedTokenPrediction(
-                token=token,
-                language=safe_token_label(item.get("language")),
-                is_foreign=bool(item.get("is_foreign", False)),
-                confidence=safe_confidence(item.get("confidence", 0.0)),
-            )
         )
 
     normalized_foreign = []
@@ -350,8 +472,8 @@ def normalize_response(parsed):
 
     main_language = safe_lang(parsed.get("main_language"))
     return NormalizedResponse(
-        main_language=main_language,
-        tokens=tuple(normalized_tokens),
+        main_language=main_language if main_language != "unknown" else SPANISH,
+        tokens=(),
         foreign_tokens=tuple(normalized_foreign),
     )
 
@@ -450,6 +572,12 @@ def build_text_row(
         "llm_latency_ms": aggregate.latency_ms,
         "llm_retry_count": aggregate.retry_count,
         "llm_call_count": aggregate.call_count,
+        "llm_total_duration_ms": aggregate.total_duration_ms,
+        "llm_load_duration_ms": aggregate.load_duration_ms,
+        "llm_prompt_eval_count": aggregate.prompt_eval_count,
+        "llm_prompt_eval_duration_ms": aggregate.prompt_eval_duration_ms,
+        "llm_eval_count": aggregate.eval_count,
+        "llm_eval_duration_ms": aggregate.eval_duration_ms,
         **base_extra,
     }
 
@@ -497,20 +625,48 @@ def predict_full_text(args, model, text, tokens):
         temperature=args.temperature,
         timeout=args.timeout,
         retries=args.retries,
+        json_retries=args.json_retries,
         retry_backoff_seconds=args.retry_backoff_seconds,
+        keep_alive=args.keep_alive,
     )
     normalized = normalize_response(llm_result.parsed)
+    foreign_predictions = align_foreign_token_predictions(
+        normalized.foreign_tokens, tokens
+    )
+    token_predictions = {}
+    for token in tokens:
+        foreign_prediction = foreign_predictions.get(token.raw_index)
+        if foreign_prediction is not None:
+            token_predictions[token.raw_index] = {
+                "token": token.raw,
+                "normalized_token": token.normalized,
+                "predicted_lang": foreign_prediction["predicted_lang"],
+                "is_foreign": True,
+                "confidence": foreign_prediction["confidence"],
+            }
+        else:
+            token_predictions[token.raw_index] = {
+                "token": token.raw,
+                "normalized_token": token.normalized,
+                "predicted_lang": SPANISH,
+                "is_foreign": False,
+                "confidence": 0.0,
+            }
     return AggregatePrediction(
         main_language=normalized.main_language,
-        token_predictions=align_token_predictions(normalized.tokens, tokens),
-        foreign_predictions=align_foreign_token_predictions(
-            normalized.foreign_tokens, tokens
-        ),
+        token_predictions=token_predictions,
+        foreign_predictions=foreign_predictions,
         valid_json=llm_result.valid_json,
         parse_error=llm_result.parse_error,
         latency_ms=llm_result.latency_ms,
         retry_count=llm_result.retry_count,
         call_count=1,
+        total_duration_ms=llm_result.total_duration_ms,
+        load_duration_ms=llm_result.load_duration_ms,
+        prompt_eval_count=llm_result.prompt_eval_count,
+        prompt_eval_duration_ms=llm_result.prompt_eval_duration_ms,
+        eval_count=llm_result.eval_count,
+        eval_duration_ms=llm_result.eval_duration_ms,
     )
 
 
@@ -521,7 +677,7 @@ def predicted_lang_for_token(aggregate, token_index):
     foreign_prediction = aggregate.foreign_predictions.get(token_index)
     if foreign_prediction is not None:
         return foreign_prediction["predicted_lang"], foreign_prediction["confidence"]
-    return "unknown", 0.0
+    return SPANISH, 0.0
 
 
 def init_pure_group():
@@ -643,6 +799,88 @@ def record_transport_status(consecutive_failures, parse_error):
     return 0
 
 
+def format_seconds(value):
+    if value <= 0:
+        return "0s"
+    if value < 60:
+        return f"{value:.1f}s"
+    minutes, seconds = divmod(int(round(value)), 60)
+    if minutes < 60:
+        return f"{minutes}m{seconds:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def log_periodic_progress(
+    *,
+    args,
+    model,
+    dataset_name,
+    processed,
+    total,
+    started_at,
+    last_logged_at,
+    invalid_json_count,
+    consecutive_transport_failures,
+    latency_stats,
+    prompt_eval_stats,
+    eval_stats,
+):
+    if args.progress_every <= 0:
+        return last_logged_at
+    if processed <= 0 or processed >= total or processed % args.progress_every != 0:
+        return last_logged_at
+
+    now = time.monotonic()
+    if last_logged_at is not None and (
+        now - last_logged_at < max(0.0, args.progress_min_seconds)
+    ):
+        return last_logged_at
+
+    elapsed = max(now - started_at, 0.001)
+    rate = processed / elapsed
+    remaining = max(total - processed, 0)
+    eta_seconds = remaining / rate if rate > 0 else 0.0
+    percent = (processed / total * 100.0) if total else 100.0
+    log(
+        f"[{model}] {dataset_name}: {processed}/{total} ({percent:.1f}%) "
+        f"elapsed={format_seconds(elapsed)} rate={rate:.2f}/s "
+        f"eta={format_seconds(eta_seconds)} invalid_json={invalid_json_count} "
+        f"transport_streak={consecutive_transport_failures} "
+        f"mean_latency_ms={stats_mean(latency_stats):.1f} "
+        f"mean_prompt_tokens={stats_mean(prompt_eval_stats):.1f} "
+        f"mean_eval_tokens={stats_mean(eval_stats):.1f}"
+    )
+    return now
+
+
+def log_dataset_start(model, dataset_name, total):
+    log(f"[{model}] Starting {dataset_name} evaluation ({total} samples)")
+
+
+def log_dataset_completion(
+    *,
+    model,
+    dataset_name,
+    total,
+    started_at,
+    invalid_json_count,
+    latency_stats,
+    prompt_eval_stats,
+    eval_stats,
+):
+    elapsed = max(time.monotonic() - started_at, 0.001)
+    rate = total / elapsed if total else 0.0
+    mean_latency_ms = stats_mean(latency_stats)
+    log(
+        f"[{model}] Completed {dataset_name} evaluation in {format_seconds(elapsed)} "
+        f"rate={rate:.2f}/s invalid_json={invalid_json_count} "
+        f"mean_llm_latency_ms={mean_latency_ms:.1f} "
+        f"mean_prompt_tokens={stats_mean(prompt_eval_stats):.1f} "
+        f"mean_eval_tokens={stats_mean(eval_stats):.1f}"
+    )
+
+
 def evaluate_pure_dataset(
     *,
     args,
@@ -653,9 +891,19 @@ def evaluate_pure_dataset(
     groups,
 ):
     consecutive_transport_failures = 0
+    total_samples = len(samples)
+    dataset_started_at = time.monotonic()
+    last_progress_log_at = None
+    invalid_json_count = 0
+    latency_stats = new_stats()
+    prompt_eval_stats = new_stats()
+    eval_stats = new_stats()
 
-    for sample in samples:
+    log_dataset_start(model, "pure", total_samples)
+
+    for sample_index, sample in enumerate(samples, start=1):
         tokens = tokenize(sample.text)
+        token_count = len(tokens)
         base_extra = {
             "row_index": sample.row_index,
             "flores_config": sample.flores_config,
@@ -681,19 +929,22 @@ def evaluate_pure_dataset(
         text_group["total"] += 1
         text_group["correct"] += int(text_row["correct"])
         text_group["invalid_json"] += int(not full_prediction.valid_json)
+        invalid_json_count += int(not full_prediction.valid_json)
         update_stats(text_group["latency_ms"], text_row["llm_latency_ms"])
         update_stats(text_group["retry_count"], text_row["llm_retry_count"])
         update_stats(text_group["call_count"], text_row["llm_call_count"])
+        update_stats(latency_stats, full_prediction.latency_ms)
+        update_stats(prompt_eval_stats, full_prediction.prompt_eval_count)
+        update_stats(eval_stats, full_prediction.eval_count)
         if should_save_raw_row(text_row, args.save_raw_level):
             text_writer.write(text_row)
 
+        foreign_prediction_indexes = set(full_prediction.foreign_predictions)
         for token in tokens:
             predicted_lang, confidence = predicted_lang_for_token(
                 full_prediction, token.raw_index
             )
-            is_foreign_predicted = (
-                token.raw_index in full_prediction.foreign_predictions
-            )
+            is_foreign_predicted = token.raw_index in foreign_prediction_indexes
             word_row = build_word_row(
                 dataset_name="pure",
                 sample_id=sample.sample_id,
@@ -719,12 +970,38 @@ def evaluate_pure_dataset(
             if should_save_raw_row(word_row, args.save_raw_level):
                 word_writer.write(word_row)
 
+        last_progress_log_at = log_periodic_progress(
+            args=args,
+            model=model,
+            dataset_name="pure",
+            processed=sample_index,
+            total=total_samples,
+            started_at=dataset_started_at,
+            last_logged_at=last_progress_log_at,
+            invalid_json_count=invalid_json_count,
+            consecutive_transport_failures=consecutive_transport_failures,
+            latency_stats=latency_stats,
+            prompt_eval_stats=prompt_eval_stats,
+            eval_stats=eval_stats,
+        )
+
         if args.max_consecutive_transport_failures > 0 and (
             consecutive_transport_failures >= args.max_consecutive_transport_failures
         ):
             raise RuntimeError(
                 "Exceeded max consecutive transport failures during pure full-text evaluation."
             )
+
+    log_dataset_completion(
+        model=model,
+        dataset_name="pure",
+        total=total_samples,
+        started_at=dataset_started_at,
+        invalid_json_count=invalid_json_count,
+        latency_stats=latency_stats,
+        prompt_eval_stats=prompt_eval_stats,
+        eval_stats=eval_stats,
+    )
 
 
 def evaluate_mixed_dataset(
@@ -739,8 +1016,17 @@ def evaluate_mixed_dataset(
     groups,
 ):
     consecutive_transport_failures = 0
+    total_samples = len(samples)
+    dataset_started_at = time.monotonic()
+    last_progress_log_at = None
+    invalid_json_count = 0
+    latency_stats = new_stats()
+    prompt_eval_stats = new_stats()
+    eval_stats = new_stats()
 
-    for sample in samples:
+    log_dataset_start(model, dataset_name, total_samples)
+
+    for sample_index, sample in enumerate(samples, start=1):
         tokens = tokenize(sample["text"])
         injected_indexes = {
             injection["token_index"]: injection for injection in sample["injections"]
@@ -777,13 +1063,18 @@ def evaluate_mixed_dataset(
         metric_group["text_total"] += 1
         metric_group["text_correct"] += int(text_row["correct"])
         metric_group["invalid_json"] += int(not aggregate.valid_json)
+        invalid_json_count += int(not aggregate.valid_json)
         update_stats(metric_group["latency_ms"], aggregate.latency_ms)
         update_stats(metric_group["retry_count"], aggregate.retry_count)
         update_stats(metric_group["call_count"], aggregate.call_count)
+        update_stats(latency_stats, aggregate.latency_ms)
+        update_stats(prompt_eval_stats, aggregate.prompt_eval_count)
+        update_stats(eval_stats, aggregate.eval_count)
 
+        foreign_prediction_indexes = set(aggregate.foreign_predictions)
         for token in tokens:
             truth = token.raw_index in injected_indexes
-            is_foreign_predicted = token.raw_index in aggregate.foreign_predictions
+            is_foreign_predicted = token.raw_index in foreign_prediction_indexes
             predicted_lang, confidence = predicted_lang_for_token(
                 aggregate, token.raw_index
             )
@@ -805,16 +1096,43 @@ def evaluate_mixed_dataset(
             if should_save_raw_row(word_row, args.save_raw_level):
                 word_writer.write(word_row)
 
+        last_progress_log_at = log_periodic_progress(
+            args=args,
+            model=model,
+            dataset_name=dataset_name,
+            processed=sample_index,
+            total=total_samples,
+            started_at=dataset_started_at,
+            last_logged_at=last_progress_log_at,
+            invalid_json_count=invalid_json_count,
+            consecutive_transport_failures=consecutive_transport_failures,
+            latency_stats=latency_stats,
+            prompt_eval_stats=prompt_eval_stats,
+            eval_stats=eval_stats,
+        )
+
         if args.max_consecutive_transport_failures > 0 and (
-            consecutive_transport_failures
-            >= args.max_consecutive_transport_failures
+            consecutive_transport_failures >= args.max_consecutive_transport_failures
         ):
             raise RuntimeError(
                 f"Exceeded max consecutive transport failures during {evaluation_name}."
             )
 
+    log_dataset_completion(
+        model=model,
+        dataset_name=dataset_name,
+        total=total_samples,
+        started_at=dataset_started_at,
+        invalid_json_count=invalid_json_count,
+        latency_stats=latency_stats,
+        prompt_eval_stats=prompt_eval_stats,
+        eval_stats=eval_stats,
+    )
 
-def write_run_metadata(args, output_dir, models, prepared_profile_dir, prepared_summary):
+
+def write_run_metadata(
+    args, output_dir, models, prepared_profile_dir, prepared_summary
+):
     metadata = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "args": vars(args),
@@ -844,6 +1162,12 @@ def close_dataset_writers(writer_bundle):
         writer.close()
 
 
+def limit_samples(samples, max_samples):
+    if max_samples <= 0:
+        return samples
+    return samples[:max_samples]
+
+
 def main():
     args = parse_args()
     validate_args(args)
@@ -866,12 +1190,35 @@ def main():
     prepared_summary = prepared_manifest_summary(prepared_manifest)
     pure_samples = []
     if not args.skip_pure:
-        pure_samples = prepared_datasets["pure"]
+        pure_samples = limit_samples(prepared_datasets["pure"], args.max_samples)
         if not pure_samples:
             raise RuntimeError("No prepared pure samples were loaded for evaluation.")
 
-    injected_samples = prepared_datasets.get("injected", [])
-    phrase_samples = prepared_datasets.get("phrase", [])
+    injected_samples = limit_samples(
+        prepared_datasets.get("injected", []), args.max_samples
+    )
+    phrase_samples = limit_samples(
+        prepared_datasets.get("phrase", []), args.max_samples
+    )
+
+    enabled_datasets = []
+    if not args.skip_pure:
+        enabled_datasets.append(f"pure={len(pure_samples)}")
+    if not args.skip_injected:
+        enabled_datasets.append(f"injected={len(injected_samples)}")
+    if not args.skip_phrase_swaps:
+        enabled_datasets.append(f"phrase={len(phrase_samples)}")
+
+    log(
+        "Starting LLM evaluation "
+        f"profile={prepared_summary['profile_id']} "
+        f"models={models} "
+        f"datasets={', '.join(enabled_datasets)} "
+        f"timeout={args.timeout}s retries={args.retries} "
+        f"json_retries={args.json_retries} keep_alive={args.keep_alive} "
+        f"progress_every={args.progress_every} "
+        f"progress_min_seconds={args.progress_min_seconds}"
+    )
 
     write_run_metadata(
         args,
@@ -891,6 +1238,7 @@ def main():
 
     try:
         for model in models:
+            model_started_at = time.monotonic()
             log(f"Starting Ollama evaluation for model {model}")
             if not args.skip_pure:
                 evaluate_pure_dataset(
@@ -923,6 +1271,10 @@ def main():
                     word_writer=phrase_writers["word"],
                     groups=phrase_groups,
                 )
+            log(
+                f"Completed Ollama evaluation for model {model} in "
+                f"{format_seconds(time.monotonic() - model_started_at)}"
+            )
     finally:
         close_dataset_writers(pure_writers)
         close_dataset_writers(injected_writers)
