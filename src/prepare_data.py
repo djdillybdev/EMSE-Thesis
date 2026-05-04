@@ -199,6 +199,35 @@ def is_eligible_word(value):
     return value.isalpha()
 
 
+def is_acronym_token(token):
+    normalized = token.normalized if isinstance(token, Token) else str(token or "")
+    return len(normalized) > 1 and normalized.isupper()
+
+
+def is_eligible_injected_token(token, min_word_length):
+    normalized = token.normalized if isinstance(token, Token) else str(token or "")
+    if not is_eligible_word(normalized):
+        return False
+    if len(normalized) < min_word_length:
+        return False
+    if is_acronym_token(token):
+        return False
+    return True
+
+
+def is_lowercase_token(token):
+    normalized = token.normalized if isinstance(token, Token) else str(token or "")
+    return bool(normalized) and normalized.islower()
+
+
+def prefer_lowercase_tokens(tokens, rng):
+    lowercase_tokens = [token for token in tokens if is_lowercase_token(token)]
+    other_tokens = [token for token in tokens if not is_lowercase_token(token)]
+    rng.shuffle(lowercase_tokens)
+    rng.shuffle(other_tokens)
+    return lowercase_tokens + other_tokens
+
+
 def tokenize(text):
     tokens = []
     for raw_index, match in enumerate(WHITESPACE_TOKEN_RE.finditer(text or "")):
@@ -268,16 +297,36 @@ def nearest_token_by_relative_position(target_token, source_tokens, target_count
     return source_tokens[source_index]
 
 
-def build_injected_sample(spanish_sample, foreign_sample, injection_lang, ratio, rng):
+def build_injected_sample(
+    spanish_sample,
+    foreign_sample,
+    injection_lang,
+    ratio,
+    min_word_length,
+    rng,
+):
     spanish_tokens = tokenize(spanish_sample.text)
     foreign_tokens = tokenize(foreign_sample.text)
     raw_parts = raw_text_parts(spanish_sample.text)
     if not spanish_tokens or not foreign_tokens or not raw_parts:
         return None
 
-    injection_count = max(1, round(len(spanish_tokens) * ratio))
-    candidate_tokens = spanish_tokens[:]
-    rng.shuffle(candidate_tokens)
+    candidate_tokens = [
+        token
+        for token in spanish_tokens
+        if is_eligible_injected_token(token, min_word_length)
+    ]
+    eligible_foreign_tokens = [
+        token
+        for token in foreign_tokens
+        if is_eligible_injected_token(token, min_word_length)
+    ]
+    if not candidate_tokens or not eligible_foreign_tokens:
+        return None
+
+    injection_count = max(1, round(len(candidate_tokens) * ratio))
+    candidate_tokens = prefer_lowercase_tokens(candidate_tokens, rng)
+    eligible_foreign_tokens = prefer_lowercase_tokens(eligible_foreign_tokens, rng)
 
     replacements = []
     used_indexes = set()
@@ -288,13 +337,11 @@ def build_injected_sample(spanish_sample, foreign_sample, injection_lang, ratio,
             continue
 
         foreign_token = nearest_token_by_relative_position(
-            spanish_token, foreign_tokens, len(raw_parts)
+            spanish_token, eligible_foreign_tokens, len(raw_parts)
         )
         if foreign_token is None:
             continue
         if foreign_token.normalized.casefold() == spanish_token.normalized.casefold():
-            continue
-        if not is_eligible_word(foreign_token.normalized):
             continue
 
         replacement = (
@@ -501,6 +548,8 @@ def prepared_profile_manifest(args):
         "injection_configs": injection_configs,
         "seed": args.seed,
         "injection_ratio": args.injection_ratio,
+        "injected_min_word_length": args.injected_min_word_length,
+        "injected_exclude_acronyms": True,
         "phrase_replacement_ratio": args.phrase_replacement_ratio,
         "phrase_span_min": args.phrase_span_min,
         "phrase_span_max": args.phrase_span_max,
@@ -662,6 +711,7 @@ def prepare_datasets(args, token):
                 foreign_sample,
                 injection_lang,
                 args.injection_ratio,
+                args.injected_min_word_length,
                 injected_rng,
             )
             if injected_sample is not None:
@@ -780,11 +830,21 @@ def parse_args():
     parser.add_argument(
         "--injection-ratio",
         type=float,
-        default=0.15,
+        default=0.2,
         help=(
             "Approximate share of eligible Spanish tokens to replace when "
             "building the token-level injected dataset. Must be in `(0, 1]`. "
             "Default: %(default)s."
+        ),
+    )
+    parser.add_argument(
+        "--injected-min-word-length",
+        type=int,
+        default=3,
+        help=(
+            "Minimum normalized word length for token-level injected samples. "
+            "Applies to both the Spanish token being replaced and the foreign "
+            "replacement token. Acronyms are excluded. Default: %(default)s."
         ),
     )
     parser.add_argument(
@@ -800,7 +860,7 @@ def parse_args():
     parser.add_argument(
         "--phrase-replacement-ratio",
         type=float,
-        default=0.15,
+        default=0.2,
         help=(
             "Approximate share of eligible Spanish tokens to cover with "
             "foreign phrase-span replacements in the phrase dataset. "
@@ -849,6 +909,8 @@ def parse_args():
 def validate_args(args):
     if args.injection_ratio <= 0.0 or args.injection_ratio > 1.0:
         raise ValueError("--injection-ratio must be in the range (0, 1].")
+    if args.injected_min_word_length < 1:
+        raise ValueError("--injected-min-word-length must be at least 1.")
     if args.phrase_replacement_ratio <= 0.0 or args.phrase_replacement_ratio > 1.0:
         raise ValueError("--phrase-replacement-ratio must be in the range (0, 1].")
     if args.phrase_span_min < 1:

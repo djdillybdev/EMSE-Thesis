@@ -35,9 +35,9 @@ PROMPT = """Find foreign-word tokens inside Spanish text.
 
 Analyze only the text between <INPUT> and </INPUT>.
 Assume the sentence is Spanish-context text.
+Return JSON only.
 
-Return JSON only with this structure:
-
+Return this structure:
 {
   "main_language": "es",
   "foreign_tokens": [
@@ -52,10 +52,17 @@ Return JSON only with this structure:
 Rules:
 - Always set "main_language" to "es".
 - Include only natural-language words that are not Spanish in "foreign_tokens".
-- Do not include punctuation, numbers, acronyms, or proper nouns.
-- Preserve each returned token exactly as written in the input.
-- Use ISO 639-1 codes when the foreign language is clear, otherwise use "unknown".
-- If no foreign words are present, return an empty "foreign_tokens" array.
+- Exclude proper nouns, names, brands, titles, organizations, places, acronyms, initialisms, URLs, emails, hashtags, code, numbers, punctuation, and symbols.
+- Exclude Spanish words and adapted loanwords commonly used in Spanish.
+- Preserve each returned token exactly as written.
+- Use ISO 639-1 language codes when clear; otherwise use "unknown".
+- When uncertain, exclude the token.
+- If none are found, return an empty "foreign_tokens" array.
+
+Examples:
+Apple presentó el nuevo iPhone. -> {"main_language":"es","foreign_tokens":[]}
+La NASA publicó datos. -> {"main_language":"es","foreign_tokens":[]}
+Me gusta hacer running. -> {"main_language":"es","foreign_tokens":[{"token":"running","language":"en","confidence":0.95}]}
 
 <INPUT>
 {{sentence}}
@@ -63,8 +70,8 @@ Rules:
 
 
 MODEL_FAMILY = "ollama_llm"
-# DEFAULT_MODELS = "llama3.2:latest,ministral-3:8b,qwen3.5:9b"
-DEFAULT_MODELS = "ministral-3:8b"
+# DEFAULT_MODELS = "llama3.2:latest,ministral-3:8b,qwen3.5:4b,gemma4"
+DEFAULT_MODELS = "gemma4"
 SPANISH = "es"
 ISO_LANG_RE = re.compile(r"^[a-z]{2}$")
 SPECIAL_TOKEN_LABELS = {"punctuation", "number", "proper_noun", "acronym", "unknown"}
@@ -158,7 +165,7 @@ def parse_args():
     )
     parser.add_argument(
         "--output-dir",
-        default="evaluation_results/flores_llm_run_ministral",
+        default="evaluation_results/flores_llm_run_gemma",
     )
     parser.add_argument(
         "--prepared-data-dir",
@@ -209,7 +216,7 @@ def parse_args():
     parser.add_argument(
         "--progress-every",
         type=int,
-        default=50,
+        default=25,
         help="Report dataset progress every N samples. Use 0 to disable periodic logs.",
     )
     parser.add_argument(
@@ -217,6 +224,11 @@ def parse_args():
         type=float,
         default=30.0,
         help="Minimum seconds between periodic progress logs.",
+    )
+    parser.add_argument(
+        "--debug-llm",
+        action="store_true",
+        help="Log each rendered prompt and raw Ollama response.",
     )
     return parser.parse_args()
 
@@ -237,11 +249,66 @@ def duration_ms_from_ns(value):
         return 0.0
 
 
-def call_ollama(model, prompt, ollama_url, temperature, timeout, keep_alive):
-    url = f"{ollama_url.rstrip('/')}/api/chat"
+def format_transport_error(exc):
+    message = f"transport_error:{type(exc).__name__}: {exc}"
+    if not isinstance(exc, HTTPError):
+        return message
+
+    try:
+        body = exc.read().decode("utf-8", errors="replace").strip()
+    except Exception:
+        body = ""
+    if not body:
+        return message
+    return f"{message} body={body}"
+
+
+def debug_log_llm_event(
+    *,
+    enabled,
+    model,
+    stage,
+    prompt,
+    sample_label=None,
+    raw_text=None,
+    error=None,
+):
+    if not enabled:
+        return
+
+    header = f"[{model}] LLM {stage}"
+    if sample_label:
+        header = f"{header} sample={sample_label}"
+    log(header)
+    log(f"[{model}] Prompt:\n{prompt}")
+    if raw_text is not None:
+        log(f"[{model}] Response:\n{raw_text}")
+    if error is not None:
+        log(f"[{model}] Error: {error}")
+
+
+def call_ollama(
+    model,
+    prompt,
+    ollama_url,
+    temperature,
+    timeout,
+    keep_alive,
+    debug_llm=False,
+    sample_label=None,
+    attempt_label=None,
+):
+    debug_log_llm_event(
+        enabled=debug_llm,
+        model=model,
+        stage=attempt_label or "request",
+        prompt=prompt,
+        sample_label=sample_label,
+    )
+    url = f"{ollama_url.rstrip('/')}/api/generate"
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "prompt": prompt,
         "stream": False,
         "format": RESPONSE_SCHEMA,
         "keep_alive": keep_alive,
@@ -258,8 +325,17 @@ def call_ollama(model, prompt, ollama_url, temperature, timeout, keep_alive):
     response = urlopen(request, timeout=timeout)
     latency_ms = (time.perf_counter() - start) * 1000.0
     data = json.loads(response.read().decode("utf-8"))
+    raw_text = data.get("response", "")
+    debug_log_llm_event(
+        enabled=debug_llm,
+        model=model,
+        stage=(attempt_label or "request") + "_response",
+        prompt=prompt,
+        sample_label=sample_label,
+        raw_text=raw_text,
+    )
     return (
-        data.get("message", {}).get("content", ""),
+        raw_text,
         latency_ms,
         {
             "total_duration_ms": duration_ms_from_ns(data.get("total_duration")),
@@ -285,6 +361,8 @@ def call_with_retry(
     json_retries,
     retry_backoff_seconds,
     keep_alive,
+    debug_llm=False,
+    sample_label=None,
 ):
     total_latency = 0.0
     last_error = None
@@ -310,12 +388,23 @@ def call_with_retry(
                 temperature=temperature,
                 timeout=timeout,
                 keep_alive=keep_alive,
+                debug_llm=debug_llm,
+                sample_label=sample_label,
+                attempt_label=f"transport_attempt_{attempt + 1}",
             )
             total_latency += latency
             last_raw = raw_text
         except (HTTPError, URLError, TimeoutError, OSError) as exc:
             total_latency += (time.perf_counter() - attempt_started_at) * 1000.0
-            last_error = f"transport_error:{type(exc).__name__}: {exc}"
+            last_error = format_transport_error(exc)
+            debug_log_llm_event(
+                enabled=debug_llm,
+                model=model,
+                stage=f"transport_attempt_{attempt + 1}_error",
+                prompt=prompt,
+                sample_label=sample_label,
+                error=last_error,
+            )
             if attempt < retries:
                 transport_retry_count += 1
                 sleep_seconds = max(0.0, retry_backoff_seconds) * (2**attempt)
@@ -362,6 +451,15 @@ def call_with_retry(
                 )
             except Exception as exc:
                 last_error = str(exc)
+                debug_log_llm_event(
+                    enabled=debug_llm,
+                    model=model,
+                    stage=f"json_attempt_{json_attempt + 1}_error",
+                    prompt=prompt,
+                    sample_label=sample_label,
+                    raw_text=raw_text,
+                    error=last_error,
+                )
                 if json_attempt >= json_retries:
                     break
                 json_retry_count += 1
@@ -374,6 +472,9 @@ def call_with_retry(
                         temperature=temperature,
                         timeout=timeout,
                         keep_alive=keep_alive,
+                        debug_llm=debug_llm,
+                        sample_label=sample_label,
+                        attempt_label=f"json_retry_{json_attempt + 1}",
                     )
                     total_latency += latency
                     last_raw = raw_text
@@ -381,8 +482,14 @@ def call_with_retry(
                     total_latency += (
                         time.perf_counter() - json_retry_started_at
                     ) * 1000.0
-                    last_error = (
-                        f"transport_error:{type(retry_exc).__name__}: {retry_exc}"
+                    last_error = format_transport_error(retry_exc)
+                    debug_log_llm_event(
+                        enabled=debug_llm,
+                        model=model,
+                        stage=f"json_retry_{json_attempt + 1}_error",
+                        prompt=prompt,
+                        sample_label=sample_label,
+                        error=last_error,
                     )
                     return LLMResult(
                         parsed=None,
@@ -617,7 +724,7 @@ def build_word_row(
     }
 
 
-def predict_full_text(args, model, text, tokens):
+def predict_full_text(args, model, text, tokens, sample_label=None):
     llm_result = call_with_retry(
         model=model,
         prompt=prompt_for_text(text),
@@ -628,6 +735,8 @@ def predict_full_text(args, model, text, tokens):
         json_retries=args.json_retries,
         retry_backoff_seconds=args.retry_backoff_seconds,
         keep_alive=args.keep_alive,
+        debug_llm=args.debug_llm,
+        sample_label=sample_label,
     )
     normalized = normalize_response(llm_result.parsed)
     foreign_predictions = align_foreign_token_predictions(
@@ -909,7 +1018,13 @@ def evaluate_pure_dataset(
             "flores_config": sample.flores_config,
             "true_lang": sample.lang,
         }
-        full_prediction = predict_full_text(args, model, sample.text, tokens)
+        full_prediction = predict_full_text(
+            args,
+            model,
+            sample.text,
+            tokens,
+            sample_label=f"pure:{sample.sample_id}",
+        )
         consecutive_transport_failures = record_transport_status(
             consecutive_transport_failures, full_prediction.parse_error
         )
@@ -1039,7 +1154,13 @@ def evaluate_mixed_dataset(
             "contamination_type": sample["contamination_type"],
         }
 
-        aggregate = predict_full_text(args, model, sample["text"], tokens)
+        aggregate = predict_full_text(
+            args,
+            model,
+            sample["text"],
+            tokens,
+            sample_label=f"{dataset_name}:{sample['sample_id']}",
+        )
 
         consecutive_transport_failures = record_transport_status(
             consecutive_transport_failures, aggregate.parse_error
@@ -1216,6 +1337,7 @@ def main():
         f"datasets={', '.join(enabled_datasets)} "
         f"timeout={args.timeout}s retries={args.retries} "
         f"json_retries={args.json_retries} keep_alive={args.keep_alive} "
+        f"debug_llm={args.debug_llm} "
         f"progress_every={args.progress_every} "
         f"progress_min_seconds={args.progress_min_seconds}"
     )

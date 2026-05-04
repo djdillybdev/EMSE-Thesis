@@ -17,7 +17,7 @@ LABEL_NOT_ES = "not_es"
 FASTTEXT_LABEL_PREFIX = "__label__"
 
 DEFAULT_WIKIPEDIA_NEGATIVE_LANGS = "en,fr,de,it,pt,nl,pl,sv"
-DEFAULT_EUROPARL_PAIRS = "en-es,en-fr,en-de,en-it,en-pt,en-nl,en-pl,en-sv"
+DEFAULT_EUROPARL_PAIRS = "en-es,en-fr,de-en,en-it,en-pt,en-nl,en-pl,en-sv"
 DEFAULT_FLORES_NEGATIVE_CONFIGS = (
     "eng_Latn,fra_Latn,deu_Latn,ita_Latn,por_Latn,nld_Latn,pol_Latn,swe_Latn"
 )
@@ -551,7 +551,9 @@ def split_quota(total, keys):
         return {}
     base = total // len(keys)
     remainder = total % len(keys)
-    return {key: base + (1 if index < remainder else 0) for index, key in enumerate(keys)}
+    return {
+        key: base + (1 if index < remainder else 0) for index, key in enumerate(keys)
+    }
 
 
 def deduplicate_examples(examples):
@@ -764,9 +766,7 @@ def evaluate_model(model, examples, training_unit):
         precision = tp / (tp + fp) if tp + fp else 0.0
         recall = tp / (tp + fn) if tp + fn else 0.0
         f1 = (
-            2 * precision * recall / (precision + recall)
-            if precision + recall
-            else 0.0
+            2 * precision * recall / (precision + recall) if precision + recall else 0.0
         )
         metrics["labels"][label] = {
             "precision": precision,
