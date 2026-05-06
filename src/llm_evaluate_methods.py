@@ -52,11 +52,10 @@ Return this structure:
 Rules:
 - Always set "main_language" to "es".
 - Include only natural-language words that are not Spanish in "foreign_tokens".
-- Exclude proper nouns, names, brands, titles, organizations, places, acronyms, initialisms, URLs, emails, hashtags, code, numbers, punctuation, and symbols.
+- EXCLUDE PROPER NOUNS, NAMES, NUMBERS, AND ACRONYMS
 - Exclude Spanish words and adapted loanwords commonly used in Spanish.
 - Preserve each returned token exactly as written.
 - Use ISO 639-1 language codes when clear; otherwise use "unknown".
-- When uncertain, exclude the token.
 - If none are found, return an empty "foreign_tokens" array.
 
 Examples:
@@ -67,6 +66,52 @@ Me gusta hacer running. -> {"main_language":"es","foreign_tokens":[{"token":"run
 <INPUT>
 {{sentence}}
 </INPUT>"""
+
+# PROMPT = """
+# Task: Detect unadapted foreign natural-language words in Spanish-context text.
+
+# Analyze only the text inside <INPUT>...</INPUT>.
+# The main language is Spanish.
+
+# Return valid JSON only:
+# {
+#   "main_language": "es",
+#   "foreign_tokens": [
+#     {
+#       "token": "string",
+#       "language": "ISO-639-1 code or unknown"
+#     }
+#   ]
+# }
+
+# Rules:
+# - Include only ordinary words from another language that are not commonly adapted or accepted in Spanish.
+# - Exclude proper nouns, names, brands, products, organizations, acronyms, abbreviations, numbers, symbols, URLs, hashtags, and usernames.
+# - Exclude Spanish words, Spanish inflections, and common Spanish loanwords.
+# - Preserve each returned token exactly as written.
+# - When uncertain, exclude the token.
+# - If none are found, return {"main_language":"es","foreign_tokens":[]}.
+
+# Examples:
+# Apple presentó el nuevo iPhone.
+# => {"main_language":"es","foreign_tokens":[]}
+
+# La NASA publicó datos.
+# => {"main_language":"es","foreign_tokens":[]}
+
+# Me gusta hacer running.
+# => {"main_language":"es","foreign_tokens":[{"token":"running","language":"en"}]}
+
+# El software funciona bien.
+# => {"main_language":"es","foreign_tokens":[]}
+
+# Hicimos brainstorming ayer.
+# => {"main_language":"es","foreign_tokens":[{"token":"brainstorming","language":"en"}]}
+
+# <INPUT>
+# {{sentence}}
+# </INPUT>
+# """
 
 
 MODEL_FAMILY = "ollama_llm"
