@@ -928,7 +928,7 @@ def build_window_rows_and_token_scores(
     contextual_thresholds = contextual_thresholds or ()
     shared_foreign_thresholds = shared_foreign_thresholds or ()
     token_score_inputs = defaultdict(
-        lambda: {"foreign_sum": 0.0, "main_sum": 0.0, "count": 0}
+        lambda: {"foreign_sum": 0.0, "main_sum": 0.0, "count": 0, "window_margins": []}
     )
     tokens_by_raw_index = {token.raw_index: token for token in tokens}
     token_positions = {
@@ -979,6 +979,9 @@ def build_window_rows_and_token_scores(
                 aggregate["foreign_sum"] += score.foreign_score
                 aggregate["main_sum"] += score.main_lang_score
                 aggregate["count"] += 1
+                aggregate["window_margins"].append(
+                    score.foreign_score - score.main_lang_score
+                )
 
     for (window_size, token_index), aggregate in sorted(token_score_inputs.items()):
         token_item = tokens_by_raw_index[token_index]
@@ -1173,7 +1176,11 @@ def build_contextual_hybrid_rows(
         foreign_probability = aggregate["foreign_sum"] / aggregate["count"]
         main_lang_probability = aggregate["main_sum"] / aggregate["count"]
         window_margin = foreign_probability - main_lang_probability
-        shared_foreign_window_count = int(window_margin >= shared_foreign_threshold)
+        shared_foreign_window_count = sum(
+            1
+            for margin in aggregate["window_margins"]
+            if margin >= shared_foreign_threshold
+        )
         shared_foreign_window_ratio = (
             shared_foreign_window_count / aggregate["count"]
             if aggregate["count"]
@@ -1365,7 +1372,7 @@ def run_pure_evaluation(args, models, pure_samples, supported_langs):
                         sample=sample,
                         tokens=tokens,
                         model=model,
-                        main_lang=text_prediction.predicted_lang,
+                        main_lang=sample.lang,
                         window_sizes=window_sizes,
                         thresholds=window_thresholds,
                         top_k=args.window_top_k,
@@ -1413,7 +1420,7 @@ def run_pure_evaluation(args, models, pure_samples, supported_langs):
                     for token_item in tokens:
                         word_prediction = model.predict(token_item.normalized)
                         is_foreign = is_foreign_detection(
-                            model, text_prediction.predicted_lang, word_prediction
+                            model, sample.lang, word_prediction
                         )
                         word_row = prediction_record(
                             word_prediction,

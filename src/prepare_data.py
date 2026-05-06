@@ -205,12 +205,17 @@ def is_acronym_token(token):
 
 
 def is_eligible_injected_token(token, min_word_length):
+    raw = token.raw if isinstance(token, Token) else str(token or "")
     normalized = token.normalized if isinstance(token, Token) else str(token or "")
     if not is_eligible_word(normalized):
+        return False
+    if any(char.isdigit() for char in raw):
         return False
     if len(normalized) < min_word_length:
         return False
     if is_acronym_token(token):
+        return False
+    if not normalized.islower():
         return False
     return True
 
@@ -220,12 +225,10 @@ def is_lowercase_token(token):
     return bool(normalized) and normalized.islower()
 
 
-def prefer_lowercase_tokens(tokens, rng):
-    lowercase_tokens = [token for token in tokens if is_lowercase_token(token)]
-    other_tokens = [token for token in tokens if not is_lowercase_token(token)]
-    rng.shuffle(lowercase_tokens)
-    rng.shuffle(other_tokens)
-    return lowercase_tokens + other_tokens
+def shuffle_tokens(tokens, rng):
+    shuffled = list(tokens)
+    rng.shuffle(shuffled)
+    return shuffled
 
 
 def tokenize(text):
@@ -288,13 +291,12 @@ def resolve_pure_configs(args):
     return sorted(configs)
 
 
-def nearest_token_by_relative_position(target_token, source_tokens, target_count):
-    if not source_tokens or target_count <= 1:
-        return source_tokens[0] if source_tokens else None
-    relative = target_token.raw_index / max(target_count - 1, 1)
-    source_index = round(relative * (len(source_tokens) - 1))
-    source_index = max(0, min(len(source_tokens) - 1, source_index))
-    return source_tokens[source_index]
+def random_foreign_token(source_tokens, replacement_count):
+    if not source_tokens:
+        return None
+    if replacement_count < len(source_tokens):
+        return source_tokens[replacement_count]
+    return source_tokens[replacement_count % len(source_tokens)]
 
 
 def build_injected_sample(
@@ -325,8 +327,8 @@ def build_injected_sample(
         return None
 
     injection_count = max(1, round(len(candidate_tokens) * ratio))
-    candidate_tokens = prefer_lowercase_tokens(candidate_tokens, rng)
-    eligible_foreign_tokens = prefer_lowercase_tokens(eligible_foreign_tokens, rng)
+    candidate_tokens = shuffle_tokens(candidate_tokens, rng)
+    eligible_foreign_tokens = shuffle_tokens(eligible_foreign_tokens, rng)
 
     replacements = []
     used_indexes = set()
@@ -336,9 +338,7 @@ def build_injected_sample(
         if spanish_token.raw_index in used_indexes:
             continue
 
-        foreign_token = nearest_token_by_relative_position(
-            spanish_token, eligible_foreign_tokens, len(raw_parts)
-        )
+        foreign_token = random_foreign_token(eligible_foreign_tokens, len(replacements))
         if foreign_token is None:
             continue
         if foreign_token.normalized.casefold() == spanish_token.normalized.casefold():
@@ -372,7 +372,7 @@ def build_injected_sample(
         "split": spanish_sample.split,
         "base_lang": SPANISH,
         "injected_lang": injection_lang,
-        "contamination_type": "position_token",
+        "contamination_type": "random_token",
         "injection_ratio": ratio,
         "requested_injections": injection_count,
         "actual_injections": len(replacements),
@@ -431,6 +431,11 @@ def build_phrase_sample(spanish_sample, foreign_sample, injection_lang, args, rn
             spanish_span = contiguous_token_span(spanish_tokens, start, span_length)
             if spanish_span is None:
                 continue
+            if any(
+                not is_eligible_injected_token(token, args.injected_min_word_length)
+                for token in spanish_span
+            ):
+                continue
             span_indexes = {token.raw_index for token in spanish_span}
             if span_indexes & used_indexes:
                 continue
@@ -446,7 +451,10 @@ def build_phrase_sample(spanish_sample, foreign_sample, injection_lang, args, rn
             foreign_span = foreign_tokens[foreign_start : foreign_start + span_length]
             if len(foreign_span) != span_length:
                 continue
-            if any(not is_eligible_word(token.normalized) for token in foreign_span):
+            if any(
+                not is_eligible_injected_token(token, args.injected_min_word_length)
+                for token in foreign_span
+            ):
                 continue
 
             same_count = sum(
@@ -550,9 +558,14 @@ def prepared_profile_manifest(args):
         "injection_ratio": args.injection_ratio,
         "injected_min_word_length": args.injected_min_word_length,
         "injected_exclude_acronyms": True,
+        "injected_lowercase_only": True,
+        "injected_exclude_proper_noun_like_tokens": True,
+        "injected_contamination_type": "random_token",
         "phrase_replacement_ratio": args.phrase_replacement_ratio,
         "phrase_span_min": args.phrase_span_min,
         "phrase_span_max": args.phrase_span_max,
+        "phrase_lowercase_only": True,
+        "phrase_exclude_proper_noun_like_tokens": True,
     }
 
 

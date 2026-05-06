@@ -40,10 +40,23 @@ from src.llm_evaluate_methods import (
     align_token_predictions,
     call_ollama,
     call_with_retry,
+    pure_samples_for_llm,
 )
 
 
 class LlmEvaluateMethodsTests(unittest.TestCase):
+    def test_pure_samples_for_llm_keeps_only_spanish_samples(self):
+        samples = [
+            SimpleNamespace(sample_id="es-1", lang="es"),
+            SimpleNamespace(sample_id="en-1", lang="en"),
+            SimpleNamespace(sample_id="fr-1", lang="fr"),
+            SimpleNamespace(sample_id="es-2", lang="es"),
+        ]
+
+        filtered = pure_samples_for_llm(samples)
+
+        self.assertEqual([sample.sample_id for sample in filtered], ["es-1", "es-2"])
+
     def test_call_ollama_uses_generate_endpoint(self):
         response_payload = {
             "response": '{"main_language":"es","foreign_tokens":[]}',

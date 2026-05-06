@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
 import sys
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 sys.modules.setdefault(
     "fasttext",
@@ -36,6 +38,7 @@ from src.evaluate_methods import (
     WindowScore,
     build_window_rows_and_token_scores,
     build_window_score,
+    run_pure_evaluation,
     tokenize,
 )
 
@@ -61,6 +64,18 @@ class FakeWindowModel:
             foreign_score=foreign_score,
             top_non_main_lang="fr" if predicted_lang == main_lang else main_lang,
             top_non_main_confidence=foreign_score,
+        )
+
+    def predict(self, text):
+        main_score, foreign_score = self.score_map[text]
+        predicted_lang = "es" if main_score >= foreign_score else "fr"
+        confidence = max(main_score, foreign_score)
+        return SimpleNamespace(
+            model=self.name,
+            model_family=self.family,
+            predicted_lang=predicted_lang,
+            predicted_label=predicted_lang,
+            confidence=confidence,
         )
 
 
@@ -272,6 +287,85 @@ class WindowDecisionTests(unittest.TestCase):
 
         predictions = {row["normalized_token"]: row["is_foreign_predicted"] for row in rows}
         self.assertEqual(predictions, {"bonjour": True, "hola": False, "salut": True})
+
+    def test_contextual_hybrid_uses_real_supporting_window_counts(self):
+        rows = collect_rows(
+            "hola bonjour salut bonsoir amigo",
+            {
+                "hola": (0.9, 0.1),
+                "bonjour": (0.45, 0.55),
+                "salut": (0.45, 0.55),
+                "bonsoir": (0.45, 0.55),
+                "amigo": (0.9, 0.1),
+                "hola bonjour salut": (0.2, 0.8),
+                "bonjour salut bonsoir": (0.2, 0.8),
+                "salut bonsoir amigo": (0.2, 0.8),
+            },
+            window_sizes=[3],
+            decision_modes=["contextual_hybrid"],
+            contextual_thresholds=[1.0],
+            shared_foreign_thresholds=[0.2],
+        )
+
+        row_by_token = {row["normalized_token"]: row for row in rows}
+        self.assertEqual(row_by_token["salut"]["shared_foreign_window_count"], 3)
+        self.assertEqual(row_by_token["salut"]["shared_foreign_window_ratio"], 1.0)
+
+    def test_run_pure_evaluation_uses_ground_truth_language_for_window_and_word(self):
+        sample = SimpleNamespace(
+            sample_id="sample-1",
+            row_index=0,
+            flores_config="fra_Latn",
+            lang="fr",
+            text="bonjour salut",
+        )
+        model = FakeWindowModel(
+            {
+                "bonjour salut": (0.8, 0.2),
+                "bonjour": (0.2, 0.8),
+                "salut": (0.2, 0.8),
+            }
+        )
+        args = SimpleNamespace(
+            output_dir="unused",
+            only_window=False,
+            skip_window=False,
+            save_raw_level="none",
+            save_window_raw="none",
+            window_sizes="2",
+            window_decision_modes="legacy_window",
+            window_foreign_threshold="0.2",
+            window_contextual_threshold="0.5",
+            window_shared_foreign_threshold="0.3",
+            window_shared_foreign_min_window_count=1,
+            window_shared_foreign_min_ratio=0.5,
+            window_top_k=5,
+        )
+        captured_main_langs = []
+        original_builder = build_window_rows_and_token_scores
+
+        def capture_builder(*args, **kwargs):
+            captured_main_langs.append(kwargs["main_lang"])
+            yield from original_builder(*args, **kwargs)
+
+        with TemporaryDirectory() as tmpdir, patch(
+            "src.evaluate_methods.build_window_rows_and_token_scores",
+            side_effect=capture_builder,
+        ):
+            args.output_dir = tmpdir
+            pure_metrics, pure_window_metrics = run_pure_evaluation(
+                args,
+                [model],
+                [sample],
+                supported_langs={model.name: None},
+            )
+
+        self.assertEqual(captured_main_langs, ["fr"])
+        word_metric = next(
+            row for row in pure_metrics if row["evaluation"] == "pure_word"
+        )
+        self.assertEqual(word_metric["foreign_false_positive_rate"], 0.0)
+        self.assertEqual(len(pure_window_metrics), 1)
 
 
 if __name__ == "__main__":

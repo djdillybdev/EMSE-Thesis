@@ -116,7 +116,7 @@ Me gusta hacer running. -> {"main_language":"es","foreign_tokens":[{"token":"run
 
 MODEL_FAMILY = "ollama_llm"
 # DEFAULT_MODELS = "llama3.2:latest,ministral-3:8b,qwen3.5:4b,gemma4"
-DEFAULT_MODELS = "gemma4:31b-cloud"
+DEFAULT_MODELS = "deepseek-v4-pro:cloud"
 SPANISH = "es"
 ISO_LANG_RE = re.compile(r"^[a-z]{2}$")
 SPECIAL_TOKEN_LABELS = {"punctuation", "number", "proper_noun", "acronym", "unknown"}
@@ -210,7 +210,7 @@ def parse_args():
     )
     parser.add_argument(
         "--output-dir",
-        default="evaluation_results/flores_llm_run_gemma_cloud",
+        default="evaluation_results/flores_llm_run_deepseek_cloud",
     )
     parser.add_argument(
         "--prepared-data-dir",
@@ -536,6 +536,11 @@ def call_with_retry(
                 )
             except Exception as exc:
                 last_error = str(exc)
+                sample_suffix = f" sample={sample_label}" if sample_label else ""
+                log(
+                    f"[{model}] Invalid JSON response{sample_suffix}: {last_error}\n"
+                    f"{raw_text}"
+                )
                 debug_log_llm_event(
                     enabled=debug_llm,
                     model=model,
@@ -1344,6 +1349,7 @@ def write_run_metadata(
         "args": vars(args),
         "models": [{"name": model, "family": MODEL_FAMILY} for model in models],
         "prompt": PROMPT,
+        "pure_evaluation_spanish_only": True,
         "prepared_data": prepared_summary,
         "prepared_data_dir": str(prepared_profile_dir),
     }
@@ -1374,6 +1380,10 @@ def limit_samples(samples, max_samples):
     return samples[:max_samples]
 
 
+def pure_samples_for_llm(samples):
+    return [sample for sample in samples if sample.lang == SPANISH]
+
+
 def main():
     args = parse_args()
     validate_args(args)
@@ -1396,9 +1406,12 @@ def main():
     prepared_summary = prepared_manifest_summary(prepared_manifest)
     pure_samples = []
     if not args.skip_pure:
-        pure_samples = limit_samples(prepared_datasets["pure"], args.max_samples)
+        pure_samples = pure_samples_for_llm(prepared_datasets["pure"])
+        pure_samples = limit_samples(pure_samples, args.max_samples)
         if not pure_samples:
-            raise RuntimeError("No prepared pure samples were loaded for evaluation.")
+            raise RuntimeError(
+                "No Spanish prepared pure samples were loaded for LLM evaluation."
+            )
 
     injected_samples = limit_samples(
         prepared_datasets.get("injected", []), args.max_samples
@@ -1409,7 +1422,7 @@ def main():
 
     enabled_datasets = []
     if not args.skip_pure:
-        enabled_datasets.append(f"pure={len(pure_samples)}")
+        enabled_datasets.append(f"pure_es_only={len(pure_samples)}")
     if not args.skip_injected:
         enabled_datasets.append(f"injected={len(injected_samples)}")
     if not args.skip_phrase_swaps:
