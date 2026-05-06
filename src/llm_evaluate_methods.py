@@ -116,7 +116,7 @@ Me gusta hacer running. -> {"main_language":"es","foreign_tokens":[{"token":"run
 
 MODEL_FAMILY = "ollama_llm"
 # DEFAULT_MODELS = "llama3.2:latest,ministral-3:8b,qwen3.5:4b,gemma4"
-DEFAULT_MODELS = "gemma4"
+DEFAULT_MODELS = "gemma4:31b-cloud"
 SPANISH = "es"
 ISO_LANG_RE = re.compile(r"^[a-z]{2}$")
 SPECIAL_TOKEN_LABELS = {"punctuation", "number", "proper_noun", "acronym", "unknown"}
@@ -210,7 +210,7 @@ def parse_args():
     )
     parser.add_argument(
         "--output-dir",
-        default="evaluation_results/flores_llm_run_gemma",
+        default="evaluation_results/flores_llm_run_gemma_cloud",
     )
     parser.add_argument(
         "--prepared-data-dir",
@@ -330,6 +330,46 @@ def debug_log_llm_event(
         log(f"[{model}] Response:\n{raw_text}")
     if error is not None:
         log(f"[{model}] Error: {error}")
+
+
+def json_text_from_llm_response(raw_text):
+    text = raw_text.strip()
+    if not text:
+        return text
+
+    decoder = json.JSONDecoder()
+    try:
+        parsed, end = decoder.raw_decode(text)
+        if isinstance(parsed, dict):
+            return text[:end]
+    except json.JSONDecodeError:
+        pass
+
+    if not text.startswith("```"):
+        return extract_json_object_text(text)
+
+    first_newline = text.find("\n")
+    if first_newline == -1:
+        return extract_json_object_text(text)
+
+    fenced_body = text[first_newline + 1 :]
+    if fenced_body.rstrip().endswith("```"):
+        fenced_body = fenced_body.rstrip()[:-3]
+    return extract_json_object_text(fenced_body.strip())
+
+
+def extract_json_object_text(text):
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(text):
+        if character != "{":
+            continue
+        try:
+            parsed, end = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return text[index : index + end]
+    return text.strip()
 
 
 def call_ollama(
@@ -475,7 +515,7 @@ def call_with_retry(
 
         for json_attempt in range(json_retries + 1):
             try:
-                parsed = json.loads(raw_text)
+                parsed = json.loads(json_text_from_llm_response(raw_text))
                 if not isinstance(parsed, dict):
                     raise ValueError("Top-level JSON value must be an object.")
                 return LLMResult(
