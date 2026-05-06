@@ -1,0 +1,59 @@
+{
+  "created_at": "2026-05-06T11:44:41.926399+00:00",
+  "args": {
+    "output_dir": "evaluation_results/flores_llm_run_gemma_cloud",
+    "prepared_data_dir": "/home/dilly/dev/school/EMSE-Thesis/data/prepared/flores_plus_devtest_a6a8fa42f55b",
+    "models": "gemma4:31b-cloud",
+    "skip_pure": true,
+    "skip_injected": false,
+    "skip_phrase_swaps": true,
+    "save_raw_level": "errors_only",
+    "ollama_url": "http://localhost:11434",
+    "temperature": 0.0,
+    "timeout": 45,
+    "retries": 0,
+    "json_retries": 1,
+    "retry_backoff_seconds": 1.0,
+    "max_consecutive_transport_failures": 12,
+    "keep_alive": "10m",
+    "max_samples": 0,
+    "progress_every": 5,
+    "progress_min_seconds": 30.0,
+    "debug_llm": false
+  },
+  "models": [
+    {
+      "name": "gemma4:31b-cloud",
+      "family": "ollama_llm"
+    }
+  ],
+  "prompt": "Find foreign-word tokens inside Spanish text.\n\nAnalyze only the text between <INPUT> and </INPUT>.\nAssume the sentence is Spanish-context text.\nReturn JSON only.\n\nReturn this structure:\n{\n  \"main_language\": \"es\",\n  \"foreign_tokens\": [\n    {\n      \"token\": \"\",\n      \"language\": \"\",\n      \"confidence\": 0.0\n    }\n  ]\n}\n\nRules:\n- Always set \"main_language\" to \"es\".\n- Include only natural-language words that are not Spanish in \"foreign_tokens\".\n- Exclude proper nouns, names, brands, titles, organizations, places, acronyms, initialisms, URLs, emails, hashtags, code, numbers, punctuation, and symbols.\n- Exclude Spanish words and adapted loanwords commonly used in Spanish.\n- Preserve each returned token exactly as written.\n- Use ISO 639-1 language codes when clear; otherwise use \"unknown\".\n- When uncertain, exclude the token.\n- If none are found, return an empty \"foreign_tokens\" array.\n\nExamples:\nApple presentó el nuevo iPhone. -> {\"main_language\":\"es\",\"foreign_tokens\":[]}\nLa NASA publicó datos. -> {\"main_language\":\"es\",\"foreign_tokens\":[]}\nMe gusta hacer running. -> {\"main_language\":\"es\",\"foreign_tokens\":[{\"token\":\"running\",\"language\":\"en\",\"confidence\":0.95}]}\n\n<INPUT>\n{{sentence}}\n</INPUT>",
+  "prepared_data": {
+    "profile_id": "a6a8fa42f55b",
+    "pure_configs": [
+      "cat_Latn",
+      "deu_Latn",
+      "eng_Latn",
+      "eus_Latn",
+      "fra_Latn",
+      "ita_Latn",
+      "por_Latn",
+      "spa_Latn"
+    ],
+    "injection_configs": [
+      "eng_Latn",
+      "por_Latn",
+      "ita_Latn",
+      "fra_Latn",
+      "deu_Latn",
+      "cat_Latn",
+      "eus_Latn"
+    ],
+    "sample_counts": {
+      "pure": 8096,
+      "injected": 7084,
+      "phrase": 7084
+    }
+  },
+  "prepared_data_dir": "/home/dilly/dev/school/EMSE-Thesis/data/prepared/flores_plus_devtest_a6a8fa42f55b"
+}
